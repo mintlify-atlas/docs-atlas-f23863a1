@@ -1,0 +1,246 @@
+---
+title: "Returns-Risk Classifier: Cost-Sensitive Fraud Triage"
+sidebarTitle: "Returns Risk"
+description: "How Mirror Fit's returns-risk model flags suspicious return requests for human review using cost-sensitive threshold selection — never auto-denying a refund."
+---
+
+Mirror Fit's returns-risk model is a binary classifier over return requests. It outputs a **probability** of fraud and selects a decision threshold by minimising weighted cost rather than maximising accuracy or F1. The system produces exactly two outcomes: approve a refund, or route it to a human reviewer. It can never auto-deny a refund — that constraint is structural, not conventional. A false positive costs a genuine customer a review step and some delay; it never costs them their refund.
+
+<Warning>
+The data behind this model is entirely synthetic. `returns_risk/data.py` generates a plausible returns log; there is no real returns dataset in this repository. The pipeline, cost framing, and threshold logic transfer to real data; the numeric metrics do not. Point `load_returns()` at a real extract before making any policy decision from these numbers.
+</Warning>
+
+---
+
+## Why Not 0.5?
+
+A 0.5 cut-point answers *"is fraud more likely than not?"* That is the wrong question. The real question is *"does flagging this return cost less than not flagging it?"* — and once the two errors carry different costs, the answer moves.
+
+For a return with fraud probability `p`:
+
+```
+expected cost of flagging     = (1 - p) · C_FP    # we might be wrong
+expected cost of not flagging =       p · C_FN    # it might be fraud
+
+flag when  (1 - p) · C_FP  <  p · C_FN
+    i.e.   p > C_FP / (C_FP + C_FN)
+```
+
+At the default **5:1** cost ratio (`C_FP = 5.0`, `C_FN = 1.0`), the break-even sits at **p > 0.833**.
+
+The empirical cost sweep on the validation set independently landed on **0.787**. That it agrees closely with the theoretical 0.833 is the evidence that the probabilities are calibrated well enough for this argument to hold. If those two numbers had diverged sharply, the cost reasoning would have been standing on sand.
+
+### Candidate threshold comparison (validation set)
+
+| Threshold | Label | Precision | Recall | FPR | Flag rate | FP | Cost/case |
+|----------:|-------|----------:|-------:|----:|----------:|---:|---------:|
+| 0.500 | default | 0.810 | 0.266 | 0.0049 | 0.024 | 11 | 0.0771 |
+| 0.323 | max-F1 | 0.622 | 0.390 | 0.0189 | 0.046 | 42 | 0.1325 |
+| **0.787** | **cost-optimal** | **1.000** | 0.147 | **0.0000** | 0.011 | **0** | **0.0629** |
+
+The max-F1 row is what a conventional pipeline ships. Under this cost matrix it is the **most expensive** option — more than double the cost-optimal — because F1 treats a wrongly-flagged customer and a missed fraud as equally bad, and the business does not.
+
+---
+
+## The 5:1 Cost Ratio
+
+The `CostMatrix` dataclass in `returns_risk/config.py` encodes the policy: a false positive (flagging a genuine return) costs **5 loss units**, a false negative (missing a fraudulent return) costs **1**.
+
+```python
+@dataclass(frozen=True)
+class CostMatrix:
+    false_positive: float = 5.0
+    false_negative: float = 1.0
+    true_positive:  float = 0.0
+    true_negative:  float = 0.0
+    review_cost:    float = 0.0
+```
+
+A strict expected-value calculation places the FP cost at roughly 0.60 `L` total, which would imply a ratio closer to 1:1. The 5:1 stance is justified on four grounds:
+
+<Accordion title="1. Different cost shapes">
+The FN cost is a known scalar — the merchandise loss absorbed from one fraudulent return. The FP cost is a **wide distribution with a heavy right tail**: most wrongly-flagged customers shrug and move on, but a few churn loudly, generating word-of-mouth that cannot be un-said. Weighting above the point estimate is the standard response to a heavy-tailed harm you cannot measure precisely.
+</Accordion>
+
+<Accordion title="2. Errors concentrate on specific segments">
+Errors are not spread evenly across people. They concentrate on customers with unusual-but-legitimate patterns: frequent returners, new accounts, customers who return often for fit reasons. A 2% false-positive rate spread uniformly is an annoyance; the same rate concentrated on one segment is systematic exclusion. Expected value averages over exactly the structure that makes this harmful.
+</Accordion>
+
+<Accordion title="3. Errors differ in recoverability">
+A missed fraud is recoverable — the pattern accumulates and the account surfaces later. A customer who quietly leaves after a wrongful flag is not.
+</Accordion>
+
+<Accordion title="4. On this data the argument is nearly moot">
+Ratios of 3:1, 5:1, and 20:1 all select the **same** threshold (0.787). Only 1:1 differs. The aggressive stance costs essentially nothing in recall versus a moderate one — worth knowing before spending a meeting arguing about the exact number.
+</Accordion>
+
+<Note>
+The cost matrix and the action contract are load-bearing for each other. Because a flag routes to review rather than denial, the FP cost stays bounded at *friction*. If this component auto-denied refunds, the FP cost would be far higher and 5:1 would not be nearly conservative enough.
+</Note>
+
+---
+
+## Actions
+
+`Action` is a closed `StrEnum` with exactly two members. There is no denial value available to return, even by mistake:
+
+```python
+class Action(StrEnum):
+    """The only two outcomes this system can produce."""
+    APPROVE_REFUND  = "approve_refund"
+    ROUTE_TO_REVIEW = "route_to_review"
+```
+
+The guard `_assert_no_denial_action()` runs **at import time** and raises `AssertionError` if anyone later adds an action whose value contains any of the forbidden tokens:
+
+```python
+FORBIDDEN_ACTION_TOKENS = ("deny", "reject", "block", "refuse", "decline")
+
+def _assert_no_denial_action() -> None:
+    for member in Action:
+        value = member.value.lower()
+        for token in FORBIDDEN_ACTION_TOKENS:
+            if token in value:
+                raise AssertionError(
+                    f"Action.{member.name} = {member.value!r} looks like an automated "
+                    "denial. This component routes to human review and must not deny "
+                    "refunds. See returns_risk/decision.py."
+                )
+
+_assert_no_denial_action()
+```
+
+Additionally, unusable scores (NaN, `±inf`, strings, out-of-range values) are clamped to `0.0` by `_clamp_probability()` — **failing toward the customer**, down the normal approval path, rather than inadvertently flagging them.
+
+---
+
+## Test Results
+
+Results on the held-out test set (synthetic, seed `20260821`, logistic regression, 5:1 cost ratio, n = 2,400).
+
+The threshold was chosen on the **validation** split and reported on **test**. Selecting it on test would produce optimistically biased cost figures.
+
+| Metric | Value |
+|--------|-------|
+| Precision | **0.966** |
+| Recall | **0.138** |
+| False-positive rate | **0.0005** — 1 of 2,197 genuine returns |
+| Flag rate | 0.012 — 29 returns routed to review |
+| Confusion | TP 28 · FP 1 · FN 175 · TN 2,196 |
+| Weighted cost (total) | **180.0** |
+| Weighted cost (per case) | **0.0750** |
+
+**Versus the default 0.5 threshold:** cost **216.0 → 180.0 (−16.7%)**, false positives **16 → 1**, at the price of 39 more fraudulent returns absorbed. That trade is the entire point — it is chosen deliberately, and priced.
+
+### Sensitivity to the cost ratio
+
+| FP:FN | Threshold | Precision | Recall | FPR | Cost/case |
+|-------|----------:|----------:|-------:|----:|----------:|
+| 1:1 | 0.529 | 0.857 | 0.325 | 0.0050 | 0.0617 |
+| 3:1 | 0.787 | 0.966 | 0.138 | 0.0005 | 0.0742 |
+| **5:1** | **0.787** | **0.966** | **0.138** | **0.0005** | **0.0750** |
+| 10:1 | 0.787 | 0.966 | 0.138 | 0.0005 | 0.0771 |
+
+---
+
+## Net Return Prevention
+
+A fit warning is not free — it moves the shopper to a different size. Measured on 38,509 held-out rentals from the real-data fit model:
+
+| Strategy | Warnings | Prevented | Caused | **Net** | Precision |
+|----------|----------|-----------|--------|---------|-----------|
+| Warn on every prediction | 21,682 | 6,592 | 14,334 | **−7,742** | 0.304 |
+| Warn above 0.85 confidence | 2,593 | 1,597 | 963 | **+634** | 0.616 |
+
+A model that always speaks **destroys value** — it causes more than twice the returns it prevents. The confidence gate is what makes advice deployable. Staying quiet is a feature, not a failure.
+
+---
+
+## Features
+
+The classifier is trained on the following features, defined in `returns_risk/data.py`:
+
+<CardGroup cols={2}>
+  <Card title="prior_return_rate" icon="rotate-left">
+    Returns ÷ orders over the trailing 12 months. The single strongest signal for serial abuse.
+  </Card>
+  <Card title="return_reason" icon="tag">
+    Categorical: `doesnt_fit`, `not_as_described`, `damaged`, `changed_mind`, `wrong_item`. Interacts with `used_tryon`.
+  </Card>
+  <Card title="used_tryon" icon="camera">
+    Boolean. **Absence is informative**: a fit complaint from someone who never checked the fit reads differently from one that contradicts a measured good fit.
+  </Card>
+  <Card title="account_age_days" icon="calendar">
+    New accounts with high-value returns are a risk pattern. Fraudulent accounts skew toward ages under 60 days.
+  </Card>
+  <Card title="order_value_inr" icon="indian-rupee-sign">
+    Higher-value orders attract a different fraud profile.
+  </Card>
+  <Card title="fit_mismatch_score" icon="ruler">
+    The `0–1` value produced by `mismatch_from_score()` at purchase time. Missing when the shopper skipped try-on.
+  </Card>
+</CardGroup>
+
+Full feature list from `NUMERIC_FEATURES`, `CATEGORICAL_FEATURES`, and `BOOLEAN_FEATURES`:
+
+```python
+NUMERIC_FEATURES = [
+    "fit_mismatch_score",
+    "days_since_purchase",
+    "order_value_inr",
+    "prior_orders_12m",
+    "prior_returns_12m",
+    "prior_return_rate",
+    "account_age_days",
+    "discount_pct",
+]
+CATEGORICAL_FEATURES = ["garment_type", "return_reason"]
+BOOLEAN_FEATURES     = ["used_tryon"]
+```
+
+---
+
+## Missingness
+
+`fit_mismatch_score` is absent precisely when the shopper skipped try-on at purchase. The preprocessor uses `SimpleImputer(strategy="median", add_indicator=True)` so that:
+
+1. The imputed median fills the missing value so the model can train and predict without errors.
+2. The **indicator column** (`missingindicator_fit_mismatch_score`) fires as a separate binary feature, preserving the signal that try-on was skipped.
+
+Dropping the indicator would silently make an unverified fit claim look identical to one that contradicts a measured good fit — exactly the interaction the model is built to detect.
+
+```python
+numeric = Pipeline([
+    ("impute", SimpleImputer(strategy="median", add_indicator=True)),
+    ("scale",  StandardScaler()),
+])
+```
+
+---
+
+## Running
+
+<Steps>
+  <Step title="Run the full test suite">
+    ```bash
+    returns_risk/.venv/bin/python -m returns_risk.tests
+    ```
+    Runs 32 checks: sweeps 400+ probabilities, NaN, ±inf, `None`, strings, and out-of-range floats across five thresholds. Asserts the action set never escapes `{approve_refund, route_to_review}` and never raises.
+  </Step>
+  <Step title="Run the full evaluation report">
+    ```bash
+    returns_risk/.venv/bin/python -m returns_risk.evaluate
+    ```
+    Generates the synthetic dataset, trains logistic regression with the default 5:1 cost ratio, sweeps candidate thresholds on validation, and reports held-out test performance.
+  </Step>
+  <Step title="Evaluate with a different ratio or model">
+    ```bash
+    returns_risk/.venv/bin/python -m returns_risk.evaluate --ratio 3 --model gbt
+    ```
+    Substitutes a 3:1 cost ratio and gradient boosting. The report includes the sensitivity table so you can compare directly.
+  </Step>
+</Steps>
+
+<Warning>
+All metrics above are measured on synthetic data generated by `returns_risk/data.py`. The pipeline and cost framing transfer to real data; the metrics do not. Swap `load_returns()` for a real extract — and add a fairness audit by customer segment — before making any policy decision.
+</Warning>

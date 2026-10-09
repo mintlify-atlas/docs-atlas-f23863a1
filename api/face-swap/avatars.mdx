@@ -1,0 +1,426 @@
+---
+title: "Avatar Management: Create, List, Stylize, and Delete"
+sidebarTitle: "Avatars"
+description: "REST endpoints for listing preset AI portraits, enrolling user selfies as avatars, assigning body shapes, and managing avatar lifecycle."
+---
+
+The avatar system has two tiers. The first is a fixed catalogue of AI-generated portraits: 10 diverse adults (`gen_f_01`–`gen_f_05` and `gen_m_01`–`gen_m_05`), plus additional kids, teens, Indian, and 3D cartoon avatars — 38 presets in total. These are read-only. The second tier is user-enrolled avatars, created at runtime via `POST /avatars/create`, identified by the `usr_` ID prefix. Every avatar — preset or enrolled — resolves to the same file path convention: `avatars_cache/{id}.jpg`. This means the swap engine, live WebSocket, and try-on pipeline all work with any avatar ID without special-casing.
+
+---
+
+## GET /avatars
+
+Returns the full avatar catalogue: all presets followed by any avatars enrolled on this device, in enrolment order.
+
+**Response:** `200 OK` — JSON object.
+
+<ResponseField name="avatars" type="array">
+  Array of avatar objects.
+
+  <Expandable title="Avatar object fields">
+    <ResponseField name="id" type="string">
+      Avatar ID. Preset IDs follow the pattern `gen_f_01`, `gen_m_03`,
+      `ai_g_01`, etc. Enrolled IDs start with `usr_` followed by 8 hex
+      characters.
+    </ResponseField>
+    <ResponseField name="name" type="string">
+      Display name (e.g. `"Aria"`, `"You"`).
+    </ResponseField>
+    <ResponseField name="category" type="string">
+      UI grouping: `"Women"`, `"Men"`, `"Kids"`, `"Teens"`, `"Elderly"`,
+      `"AI"`, or `"You"` for enrolled avatars.
+    </ResponseField>
+    <ResponseField name="image_url" type="string">
+      Relative URL to retrieve the avatar image, e.g.
+      `/avatars/gen_f_01/image`.
+    </ResponseField>
+    <ResponseField name="enrolled" type="boolean">
+      `true` for user-enrolled (`usr_*`) avatars; `false` for presets.
+    </ResponseField>
+    <ResponseField name="has_body" type="boolean">
+      Enrolled only. `true` once a body composite has been written via
+      `POST /avatars/{id}/body`.
+    </ResponseField>
+    <ResponseField name="base_body_id" type="string | null">
+      Enrolled only. The curated base-body ID used for the composite, e.g.
+      `"body_female_athletic"`.
+    </ResponseField>
+    <ResponseField name="has_style" type="boolean">
+      Enrolled only. `true` when a cartoon/stylized version exists.
+    </ResponseField>
+    <ResponseField name="style" type="string | null">
+      Enrolled only. Style name used to generate the cartoon, e.g.
+      `"bitmoji"`.
+    </ResponseField>
+    <ResponseField name="measurements" type="object | null">
+      Enrolled only. The measurement dict recorded at body-assignment time:
+      `{ "height_cm", "chest_cm", "waist_cm", "hips_cm" }`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+```bash
+curl http://localhost:8000/avatars
+```
+
+```json
+{
+  "avatars": [
+    {
+      "id": "gen_f_01",
+      "name": "Aria",
+      "category": "Women",
+      "image_url": "/avatars/gen_f_01/image",
+      "enrolled": false
+    },
+    {
+      "id": "usr_3a7f91bc",
+      "name": "Alex",
+      "category": "You",
+      "image_url": "/avatars/usr_3a7f91bc/image",
+      "enrolled": true,
+      "has_body": true,
+      "base_body_id": "body_male_athletic",
+      "has_style": false,
+      "style": null,
+      "measurements": { "height_cm": 178.0, "chest_cm": 96.0, "waist_cm": 78.0, "hips_cm": null }
+    }
+  ]
+}
+```
+
+---
+
+## GET /avatars/{avatar_id}/image
+
+Serves the avatar's JPEG image from `avatars_cache/{avatar_id}.jpg`. After a body composite is created, this same path returns the full-body image — the composite overwrites the original portrait in place.
+
+<ParamField path="avatar_id" type="string" required>
+  The avatar ID from `GET /avatars`.
+</ParamField>
+
+**Response:** `200 OK` — `image/jpeg` file bytes.
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `404` | Avatar ID not in catalogue, or the image file does not exist yet (run `generate_avatars.py` for presets). |
+
+### Example
+
+```bash
+curl http://localhost:8000/avatars/gen_f_01/image --output aria.jpg
+```
+
+---
+
+## POST /avatars/create
+
+Enrolls a selfie as a new user avatar. The face is validated with InsightFace before anything is written. The detected gender is recorded for the body-assignment stage but can be overridden by the `gender` field.
+
+**Request format:** `multipart/form-data`
+
+<ParamField body="photo" type="file" required>
+  A JPEG or PNG selfie. Must contain at least one detectable face. A
+  clear, front-facing photo produces the best swap results.
+</ParamField>
+
+<ParamField body="name" type="string">
+  Display name for this avatar. Defaults to `"You"`.
+</ParamField>
+
+<ParamField body="gender" type="string">
+  Override the auto-detected gender. Accepted values: `"male"`, `"female"`.
+  Leave blank to use the value InsightFace detects from the photo.
+</ParamField>
+
+**Response:** `200 OK` — JSON object.
+
+<ResponseField name="id" type="string">
+  The new `usr_*` avatar ID (8 hex characters after the prefix).
+</ResponseField>
+<ResponseField name="name" type="string">
+  The recorded display name.
+</ResponseField>
+<ResponseField name="category" type="string">
+  Always `"You"` for enrolled avatars.
+</ResponseField>
+<ResponseField name="gender" type="string | null">
+  Resolved gender: the `gender` form field if supplied, otherwise what
+  InsightFace detected, otherwise `null`.
+</ResponseField>
+<ResponseField name="image_url" type="string">
+  Relative URL to retrieve the avatar image.
+</ResponseField>
+<ResponseField name="enrolled" type="boolean">
+  Always `true`.
+</ResponseField>
+<ResponseField name="face_validated" type="boolean">
+  `true` when InsightFace confirmed a face was present. `false` in
+  `LUCY_MINIMAL_MODE=1` where detectors are not loaded.
+</ResponseField>
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | Empty file upload. |
+| `422` | No face detected. Use a clear, front-facing photo. |
+| `500` | Could not save avatar image or record to disk. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/avatars/create \
+  -F "photo=@selfie.jpg" \
+  -F "name=Alex" \
+  -F "gender=male"
+```
+
+```json
+{
+  "id": "usr_3a7f91bc",
+  "name": "Alex",
+  "category": "You",
+  "gender": "male",
+  "image_url": "/avatars/usr_3a7f91bc/image",
+  "enrolled": true,
+  "face_validated": true
+}
+```
+
+---
+
+## POST /avatars/{avatar_id}/stylize
+
+Generates a cartoon/anime portrait of an enrolled avatar by forwarding the face image to the InstantID backend running on port 7861. The stylized image is stored as `avatars_cache/{avatar_id}_style.jpg` and recorded in the avatar's metadata. The original photo used for face swapping is not replaced.
+
+<ParamField path="avatar_id" type="string" required>
+  An enrolled (`usr_*`) avatar ID. Preset avatars cannot be stylized.
+</ParamField>
+
+<ParamField body="style" type="string">
+  Style name passed to the InstantID backend. Defaults to `"bitmoji"`.
+</ParamField>
+
+**Response:** `200 OK` — JSON object.
+
+<ResponseField name="id" type="string">Avatar ID.</ResponseField>
+<ResponseField name="style" type="string">Style name that was applied.</ResponseField>
+<ResponseField name="style_image_url" type="string">
+  Relative URL to retrieve the cartoon image via
+  `GET /avatars/{id}/style-image`.
+</ResponseField>
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | Attempted to stylize a preset avatar. |
+| `404` | Avatar not found or enrolled face image missing. |
+| `503` | InstantID backend at port 7861 is not reachable. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/avatars/usr_3a7f91bc/stylize \
+  -F "style=bitmoji"
+```
+
+---
+
+## GET /avatars/{avatar_id}/style-image
+
+Returns the cartoon image previously produced by `POST /avatars/{id}/stylize`.
+
+<ParamField path="avatar_id" type="string" required>
+  An enrolled avatar ID that has been stylized.
+</ParamField>
+
+**Response:** `200 OK` — `image/jpeg` file bytes.
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `404` | Avatar not found, or no stylized image exists yet. |
+
+---
+
+## POST /avatars/{avatar_id}/body
+
+Assigns body measurements to an enrolled avatar and creates a full-body composite: the server selects a curated base-body photograph that matches the gender and build bin, runs a face swap to place the enrolled face onto that photograph, and writes the result back over `avatars_cache/{avatar_id}.jpg`. All downstream endpoints (swap, try-on, live WebSocket) then automatically use the full-body image.
+
+<ParamField path="avatar_id" type="string" required>
+  An enrolled (`usr_*`) avatar ID.
+</ParamField>
+
+<ParamField body="gender" type="string">
+  Override the gender stored at enrolment. Accepted values: `"male"`,
+  `"female"`. Falls back to the enrolled gender when omitted.
+</ParamField>
+
+<ParamField body="height_cm" type="number">
+  Height in centimetres. Plausible range: 100–230 cm. Optional — has no
+  effect on body-shape bin selection in the current logic but is recorded
+  for reference.
+</ParamField>
+
+<ParamField body="chest_cm" type="number">
+  Chest/bust circumference in centimetres. Plausible range: 50–200 cm.
+  Required together with `waist_cm` to select a non-default bin.
+</ParamField>
+
+<ParamField body="waist_cm" type="number">
+  Waist circumference in centimetres. Plausible range: 40–200 cm.
+</ParamField>
+
+<ParamField body="hips_cm" type="number">
+  Hip circumference in centimetres. Plausible range: 50–200 cm. Optional.
+</ParamField>
+
+**Response:** `200 OK` — JSON object.
+
+<ResponseField name="id" type="string">Avatar ID.</ResponseField>
+<ResponseField name="image_url" type="string">
+  URL to retrieve the updated full-body avatar image.
+</ResponseField>
+<ResponseField name="selection" type="object">
+  The body-shape selection result.
+
+  <Expandable title="selection fields">
+    <ResponseField name="base_body_id" type="string">
+      ID of the chosen base body, e.g. `"body_female_slim"`.
+    </ResponseField>
+    <ResponseField name="gender" type="string">Resolved gender.</ResponseField>
+    <ResponseField name="build" type="string">
+      Resolved build bin: `"slim"`, `"average"`, `"athletic"`, or `"plus"`.
+    </ResponseField>
+    <ResponseField name="chest_to_waist" type="number | null">
+      Chest-to-waist drop ratio. `null` when measurements were not supplied.
+    </ResponseField>
+    <ResponseField name="from_defaults" type="boolean">
+      `true` when no measurements were supplied and the `average` bin was
+      assumed.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="base_body" type="object">
+  Provenance of the selected photograph.
+
+  <Expandable title="base_body fields">
+    <ResponseField name="id" type="string">Base body asset ID.</ResponseField>
+    <ResponseField name="license" type="string">License of the photograph.</ResponseField>
+    <ResponseField name="source" type="string">Source attribution.</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="skin_tone_match" type="string">
+  Status of the optional skin-tone matching pass: `"matched"`, or a skip
+  reason string if it was not applied.
+</ResponseField>
+<ResponseField name="validation" type="array">
+  Anatomy validation checks performed on the composite before saving.
+  Each entry: `{ "check": string, "passed": boolean, "detail": string }`.
+</ResponseField>
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | Attempted to assign a body to a preset avatar. |
+| `404` | Avatar or face image not found. |
+| `422` | Measurement value out of plausible range, or face not detected in composite. |
+| `422` | Anatomy validation failed on the composed image. |
+| `501` | No curated photograph exists for the selected build bin. |
+| `503` | Face swap models not loaded (`LUCY_MINIMAL_MODE`). |
+| `500` | Body swap or save failed internally. |
+
+---
+
+## DELETE /avatars/{avatar_id}
+
+Removes an enrolled avatar and its image files from disk. Preset avatars (`gen_*`, `ai_*`) cannot be deleted and return `403`.
+
+<ParamField path="avatar_id" type="string" required>
+  An enrolled (`usr_*`) avatar ID.
+</ParamField>
+
+**Response:** `200 OK` — JSON object.
+
+<ResponseField name="deleted" type="string">
+  The ID of the avatar that was deleted.
+</ResponseField>
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `403` | Attempted to delete a preset avatar. |
+| `404` | Avatar not found. |
+
+---
+
+## Body Shape Assignment
+
+When `POST /avatars/{id}/body` is called, the `chest_cm` and `waist_cm` measurements are used together to select one of four build bins per gender. Supplying only one of the two, or neither, causes the selection to fall back to `average`.
+
+**Female cutoffs** (chest/bust in cm):
+
+| Bin | Condition |
+|-----|-----------|
+| `slim` | `chest_cm < 86.0` and `waist_cm` below plus threshold |
+| `plus` | `chest_cm > 100.0` **or** `waist_cm > 94.0` |
+| `athletic` | chest ÷ waist ≥ 1.28 (tapered silhouette) |
+| `average` | everything else |
+
+**Male cutoffs** (chest in cm):
+
+| Bin | Condition |
+|-----|-----------|
+| `slim` | `chest_cm < 94.0` and `waist_cm` below plus threshold |
+| `plus` | `chest_cm > 108.0` **or** `waist_cm > 100.0` |
+| `athletic` | chest ÷ waist ≥ 1.22 |
+| `average` | everything else |
+
+`plus` is evaluated before `athletic`: a large tapered frame is binned as `plus` so the garment fits the girth first.
+
+The resolved bin name is combined with the gender to form the `base_body_id`: `body_{gender}_{build}` — for example, `body_male_athletic` or `body_female_plus`.
+
+---
+
+## Base Bodies
+
+Base bodies are curated photographs committed to the repository under `assets/base_bodies/` and reviewed by a human before admission. Nothing in the runtime generates a base body.
+
+Use `GET /base-bodies` to check which bins have an approved photograph on this deployment.
+
+```bash
+curl http://localhost:8000/base-bodies
+```
+
+If a bin is missing its photograph, `POST /avatars/{id}/body` returns `501` naming the missing `base_body_id` rather than silently substituting a neighbouring build.
+
+---
+
+## Workflow: Enroll → Body → List
+
+```bash
+# 1. Enroll a selfie
+curl -X POST http://localhost:8000/avatars/create \
+  -F "photo=@selfie.jpg" \
+  -F "name=Alex" \
+  -F "gender=male"
+# → { "id": "usr_3a7f91bc", ... }
+
+# 2. Assign a body with measurements
+curl -X POST http://localhost:8000/avatars/usr_3a7f91bc/body \
+  -F "chest_cm=96" \
+  -F "waist_cm=78"
+# → { "selection": { "build": "athletic", ... }, ... }
+
+# 3. Confirm the avatar is in the catalogue
+curl http://localhost:8000/avatars | python3 -m json.tool
+```

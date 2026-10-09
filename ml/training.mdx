@@ -1,0 +1,210 @@
+---
+title: "Training the Fit and Returns Models"
+sidebarTitle: "Training"
+description: "How to retrain Mirror Fit's fit scoring and returns-risk models on new data, including dataset format, train/val/test splits, and export to JSON for browser inference."
+---
+
+Mirror Fit ships two ML models: the **Fit Scoring Engine** (`fit_score`) and the **Returns-Risk Classifier** (`returns_risk`). Both are logistic regression pipelines trained with scikit-learn, chosen for their naturally calibrated probabilities, inspectable coefficients, and compact JSON export. Both export to a small JSON file that the browser loads directly — there is no server needed for inference, and the browser reproduces scikit-learn's predictions exactly.
+
+---
+
+## Fit Score Training
+
+### Data source
+
+The fit score model can be trained in two modes:
+
+**Synthetic mode** (default): `fit_score/data.py` generates garment-to-body measurement ratios from industry ease allowances. The generative process starts from the physical situation rather than from the labels:
+
+1. A body is drawn (chest, shoulder, torso, arm) with realistic correlations — broad shoulders come with a broad chest.
+2. A garment is drawn as a *size pick* (XS/S/M/L/XL/XXL), because that is the real mechanism: a shopper chooses a size and the garment's measurements follow from the brand's grading.
+3. Ratios fall out. Labels are assigned from the ratios using the same tolerance rules defined in `fit_score/spec.py`.
+
+This keeps the generator honest: the label is a consequence of geometry, not an independent draw.
+
+**Real-data mode**: `fit_score/real_model.py` trains on the **RentTheRunway dataset** (Misra, Wan & McAuley, RecSys 2018) — 192,544 real rentals with customer measurements and reported fit outcomes (`small` / `fit` / `large`). The dataset is not bundled in this repository; download it from [UCSD](https://cseweb.ucsd.edu/~jmcauley/datasets.html) and configure the path in `fit_score/real_data.py`.
+
+### Generating synthetic training data
+
+```python
+from fit_score.data import load_fits, split_frame
+
+frame = load_fits(n=14_000, seed=20260821)
+train, valid, test = split_frame(frame, seed=20260821)
+# train: 8,400  valid: 2,800  test: 2,800
+```
+
+The split is a deterministic 60/20/20 permutation of the full frame. `split_frame` takes `train=0.6`, `valid=0.2` as keyword arguments if you want a different ratio.
+
+### Substituting real data
+
+Replace `load_fits()` with any function that returns a `pd.DataFrame` with the same column schema: the six raw feature columns (`chest_ratio`, `shoulder_ratio`, `length_ratio`, `sleeve_ratio`, `drape_slack`, `shoulder_drop_cm`), the seven derived columns produced by `fit_score.spec.derive()`, a `garment_type` categorical column, and a `fit_class` target column.
+
+### Training commands
+
+```bash
+# Synthetic model — report only
+returns_risk/.venv/bin/python -m fit_score.model
+
+# Synthetic model — report + export to demo/fit_model.json
+returns_risk/.venv/bin/python -m fit_score.model --export
+
+# Real-data model — report + export to demo/fit_model_real.json
+returns_risk/.venv/bin/python -m fit_score.real_model --export
+```
+
+---
+
+## Returns Risk Training
+
+### Data source
+
+`returns_risk/data.py` generates a synthetic returns log that is deliberately designed to make the problem hard rather than to flatter the model:
+
+- Fraud is rare (~7%), so accuracy is useless and the cost framing does real work.
+- The strongest signal is an interaction: claiming "doesn't fit" is suspicious only when the try-on at purchase predicted a good fit. A model that cannot represent this interaction will underperform.
+- `fit_mismatch_score` is absent whenever the shopper skipped try-on. That missingness is informative and is modelled explicitly rather than quietly imputed away.
+- Substantial label noise is injected, so the achievable AUC is bounded well below 1.0. A pipeline reporting 0.99 AUC on this data is leaking.
+
+### Three-way split
+
+```python
+from returns_risk.config import Settings
+
+cfg = Settings(
+    seed=20260821,
+    n_samples=12_000,
+    train_frac=0.60,   # 7,200 rows
+    valid_frac=0.20,   # 2,400 rows
+    # test_frac = 0.20 (remainder)
+)
+```
+
+The threshold is selected on **validation** and reported on **test**. Selecting it on test would make the reported cost optimistically biased.
+
+### Threshold selection
+
+The decision threshold is swept over the validation set using the `CostMatrix` to compute weighted cost at each candidate. The threshold that minimises cost on validation is then applied once to test for final reporting:
+
+```python
+# Empirical cost sweep — run on validation, never on test
+# flag when p > C_FP / (C_FP + C_FN)
+# At 5:1: theoretical break-even = 0.833
+# Empirical sweep result:          0.787
+```
+
+### Leave-one-out encoding for `item_small_rate`
+
+The collaborative history feature `item_small_rate` (the fraction of times this specific item is reported as running small) is computed on the **training split only** and joined onto validation and test rows. Computing it over the full frame would leak each row's own outcome into its features.
+
+For training rows themselves, **leave-one-out (LOO) encoding** is used: each row's own outcome is excluded from its group's statistic. Without LOO, gradient boosting exploited the leakage catastrophically (log loss 1.66, worse than a uniform guess at 1.10). With LOO:
+
+| | Before LOO | After LOO |
+|---|---|---|
+| GBT log loss | 1.66 | **0.70** |
+| Macro F1 | 0.471 | **0.489** |
+
+---
+
+## Model Export
+
+Both models export to JSON for browser-side inference. The JavaScript loader in `demo/outfit-score.js` reproduces the scikit-learn pipeline exactly — the same imputation, scaling, one-hot encoding, and logistic regression coefficient application.
+
+### Export targets
+
+| File | Source model | Classes | Notes |
+|------|-------------|---------|-------|
+| `demo/fit_model.json` | `fit_score.model` (synthetic) | 5 (`MADE_FOR_YOU`, `GOOD_FIT`, `OVERSIZED`, `UNDERSIZED`, `POOR_FIT`) | Used in browser try-on |
+| `demo/fit_model_real.json` | `fit_score.real_model` (RentTheRunway) | 3 (`small`, `fit`, `large`) | Not used in browser — features unavailable at webcam time |
+| `demo/returns_model.json` | `returns_risk.evaluate` | Binary (`is_fraud`) | Includes impute medians, scaler params, threshold |
+
+The JSON format bundles everything needed for inference: feature lists, imputation medians, scaler mean and scale, one-hot category lists, and the model's coefficients (or intercept + coef for logistic regression).
+
+```json
+{
+  "_comment": "Trained on SYNTHETIC data — see returns_risk/README.md.",
+  "generated_from": {
+    "seed": 20260821,
+    "model": "logreg",
+    "n_train": 7200,
+    "fp_fn_ratio": 5.0
+  },
+  "features": {
+    "numeric": ["fit_mismatch_score", "days_since_purchase", "order_value_inr", ...],
+    "categorical": ["garment_type", "return_reason"],
+    "boolean": ["used_tryon"]
+  },
+  "preprocess": {
+    "impute_medians": [...],
+    "indicator_features": ["fit_mismatch_score"],
+    "scaler_mean": [...],
+    "scaler_scale": [...]
+  }
+}
+```
+
+### Verification
+
+The browser reproduces scikit-learn exactly — all **89 features** are identical, and all three presets match on class, confidence, and `p_fit`. Missing values propagate as missing rather than being replaced with plausible defaults, so the missing-indicators fire the same way they did at training time.
+
+---
+
+## Evaluation Commands
+
+| Command | Output |
+|---------|--------|
+| `returns_risk/.venv/bin/python -m fit_score.model` | Synthetic fit model: accuracy, macro F1, per-class report, model comparison table |
+| `returns_risk/.venv/bin/python -m fit_score.model --export` | Same + writes `demo/fit_model.json` |
+| `returns_risk/.venv/bin/python -m fit_score.real_model --export` | Real-data fit model report + writes `demo/fit_model_real.json` |
+| `returns_risk/.venv/bin/python -m returns_risk.tests` | 32 unit checks — sweeps adversarial inputs, asserts no denial action ever produced |
+| `returns_risk/.venv/bin/python -m returns_risk.evaluate` | Full returns-risk report: AUC, threshold sweep, test metrics, cost table |
+| `returns_risk/.venv/bin/python -m returns_risk.evaluate --ratio 3 --model gbt` | Same with 3:1 cost ratio and gradient boosting |
+
+---
+
+## Model Selection Rationale
+
+Both logistic regression and gradient boosting (`HistGradientBoostingClassifier`) are trained and compared on every run. Logistic regression ships as the default for three reasons:
+
+<CardGroup cols={3}>
+  <Card title="Calibrated probabilities" icon="sliders">
+    The cost-sweep threshold selection depends on the model's probabilities meaning what they claim. Logistic regression keeps them approximately calibrated without any post-hoc calibration step.
+  </Card>
+  <Card title="Inspectable coefficients" icon="magnifying-glass">
+    Every coefficient is readable and matches retail intuition (e.g., `user_small_rate → small`, `category_coat → large`). This matters for auditing a system that affects customers.
+  </Card>
+  <Card title="~9 KB JSON export" icon="file-code">
+    The logistic regression pipeline serialises to roughly 9 KB of JSON. This runs in the browser with no server, no round-trip, and no dependency on a running inference endpoint.
+  </Card>
+</CardGroup>
+
+Gradient boosting is trained alongside for comparison and is available via `--model gbt`. On the returns-risk synthetic data, logistic regression (AUC 0.814, AP 0.473) edges out gradient boosting (AUC 0.808, AP 0.466) — making the choice also evidence-based, not just convenient.
+
+On the real-data fit model, gradient boosting did **worse** (macro F1 0.347 vs 0.471) — it overfit the collaborative features badly (log loss 1.66 vs 0.96 for logistic regression).
+
+---
+
+## LCM/LoRA Training
+
+The `training/` directory contains notebooks for fine-tuning the garment try-on diffusion model that powers the virtual try-on render:
+
+<CardGroup cols={2}>
+  <Card title="distill_lcm_lora.ipynb" icon="bolt">
+    LCM LoRA distillation — accelerates inference by distilling the base diffusion model into a latent consistency model with a LoRA adapter. Reduces try-on latency for the real-time AR path.
+  </Card>
+  <Card title="train_catvton_lora_vitonhd.ipynb" icon="shirt">
+    CatVTON LoRA fine-tuning on VITON-HD — trains on 13k person + garment + result triples from the VITON-HD dataset. Produces a ~20 MB LoRA adapter that improves try-on quality for jackets, shirts, and dresses. Designed to run free on Kaggle GPU (P100/T4).
+  </Card>
+</CardGroup>
+
+These notebooks are independent of the `fit_score` and `returns_risk` Python packages. They operate on the diffusion model weights, not on the logistic regression pipelines described above.
+
+---
+
+<Note>
+**Two bugs documented in `fit_score/README.md`:**
+
+1. **Target leakage in `item_small_rate`** — was originally computed from train labels, so for a training row it partly encoded that row's own outcome. Gradient boosting exploited it and collapsed (log loss 1.66). Fixed with leave-one-out encoding: each row is excluded from its own group's statistic.
+
+2. **Dead sliders in the browser demo** — the four collaborative history sliders (`user_small_rate`, `user_large_rate`, `item_small_rate`, `category_*`) were not wired into `readForm()`, so they silently did nothing and the model saw imputed medians regardless of the slider position. Caught by diffing the browser's feature vector against scikit-learn's, feature by feature.
+</Note>

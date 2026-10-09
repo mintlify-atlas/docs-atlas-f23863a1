@@ -1,0 +1,305 @@
+---
+title: "WS /ws/tryon — Live Diffusion Try-On WebSocket"
+sidebarTitle: "WS /ws/tryon"
+description: "WS /ws/tryon streams real-time diffusion-based garment try-on: send a camera frame and garment image, receive a composited JPEG output frame."
+---
+
+The `/ws/tryon` WebSocket endpoint drives the live virtual try-on experience in Mirror Fit. Once connected, the client sends a garment image to initialise the session, then streams camera frames at a fixed interval; the backend runs CatVTON diffusion inference on each frame and returns a composited JPEG blended with the previous result. The Flutter client (`decart_realtime_screen.dart`) captures and sends one frame every 3 seconds — each cycle is a fresh diffusion generation whose output is temporally blended with the prior result to smooth transitions.
+
+## Connection
+
+```
+ws://SERVER_HOST:8000/ws/tryon
+```
+
+The Flutter app resolves the backend URL at runtime. If the user has saved a custom server URL it is used; otherwise the default falls back to the configured EC2 host. The app converts any `http://` base URL to `ws://` and any `https://` base URL to `wss://` before appending `/ws/tryon`:
+
+```dart
+static String _toWsUrl(String? base) {
+  if (base == null || base.trim().isEmpty) return '';
+  var u = base.trim().replaceAll(RegExp(r'/$'), '');
+  if (u.startsWith('https://')) {
+    u = 'wss://${u.substring('https://'.length)}';
+  } else if (u.startsWith('http://')) {
+    u = 'ws://${u.substring('http://'.length)}';
+  } else if (!u.startsWith('ws://') && !u.startsWith('wss://')) {
+    u = 'wss://$u';
+  }
+  return '$u/ws/tryon';
+}
+```
+
+<Note>
+  The server accepts connections immediately after process start, but the
+  try-on model is loaded asynchronously. Check `GET /health` and confirm
+  `model_loaded: true` before opening this WebSocket to avoid a silent `error`
+  response on the first `init` message.
+</Note>
+
+## Message Protocol
+
+All messages are UTF-8 JSON text frames. The client sends typed request messages; the server sends typed response messages. The `type` field is required on every message in both directions.
+
+### Client → Server messages
+
+<ParamField body="type" type="string" required>
+  Message type. One of: `"init"`, `"frame"`, `"fabric"`, `"fabric_clear"`,
+  `"garment_back"`, `"garment_back_clear"`, `"reset"`.
+</ParamField>
+
+<ParamField body="garment_image" type="string">
+  *(Required for `init`)* Base64-encoded garment image. JPEG or PNG. PNG with
+  an alpha channel is supported — the alpha mask is used to isolate the garment
+  from its background. EXIF orientation is applied automatically.
+</ParamField>
+
+<ParamField body="garment_type" type="string">
+  *(Optional, `init` only)* Garment category hint used to shape the Stable
+  Diffusion prompt. Accepted values: `"tshirt"`, `"shirt"`, `"jacket"`.
+  Defaults to `"tshirt"` when omitted.
+</ParamField>
+
+<ParamField body="fabric_image" type="string">
+  *(Optional, `init` or `fabric`)* Base64-encoded fabric/pattern image to
+  overlay on the garment. Send as a separate `fabric` message after `init` to
+  apply without re-sending the full garment. Send `fabric_clear` to remove.
+</ParamField>
+
+<ParamField body="garment_back_image" type="string">
+  *(Optional, `init` or `garment_back`)* Base64-encoded back-view photo of the
+  garment. Used when the wearer turns around, replacing the geometric
+  colour-only wrap with a real photo. Send `garment_back_clear` to remove.
+</ParamField>
+
+<ParamField body="image" type="string">
+  *(Required for `frame`)* Base64-encoded JPEG camera frame. Canvas-captured
+  frames carry no EXIF; phone camera photos are EXIF-transposed automatically.
+  The Flutter client captures at up to 720×1280 px (portrait, 9:16) with JPEG
+  quality 0.82.
+</ParamField>
+
+### Server → Client messages
+
+<ResponseField name="type" type="string" required>
+  Response type. One of: `"ready"`, `"result"`, `"dropped"`, `"fabric_set"`,
+  `"fabric_cleared"`, `"garment_back_set"`, `"garment_back_cleared"`,
+  `"error"`.
+</ResponseField>
+
+<ResponseField name="image" type="string">
+  *(Present on `result`)* Base64-encoded JPEG of the composited try-on output.
+  Quality 88, chroma subsampling 4:4:4 (`subsampling=0`) to preserve fine
+  repeating patterns (plaid, thin stripes) without colour fringing.
+</ResponseField>
+
+<ResponseField name="diag" type="string | null">
+  *(Present on `result`)* Diagnostic string describing how the body mask for
+  this frame was constructed (e.g. which mask tier was used). `null` when no
+  diagnostic is available. Lets a client verify collar rendering without
+  reading the server log.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  *(Present on `error`)* Human-readable error description.
+</ResponseField>
+
+### Message flow example
+
+<CodeGroup>
+
+```json Client → init
+{
+  "type": "init",
+  "garment_image": "<base64-encoded PNG or JPEG>",
+  "garment_type": "tshirt",
+  "fabric_image": "<base64-encoded pattern PNG, optional>",
+  "garment_back_image": "<base64-encoded back-view JPEG, optional>"
+}
+```
+
+```json Server → ready
+{
+  "type": "ready"
+}
+```
+
+```json Client → frame
+{
+  "type": "frame",
+  "image": "<base64-encoded JPEG camera frame>"
+}
+```
+
+```json Server → result
+{
+  "type": "result",
+  "image": "<base64-encoded JPEG composited output>",
+  "diag": "mediapipe_seg+pose_fallback"
+}
+```
+
+```json Server → dropped (frame skip)
+{
+  "type": "dropped"
+}
+```
+
+```json Server → error
+{
+  "type": "error",
+  "message": "Send garment first (type: init)"
+}
+```
+
+</CodeGroup>
+
+## Frame Blending
+
+The server uses temporal blending to smooth the output between successive diffusion generations. After each inference pass the new result is blended with the previous output using a fixed `alpha_new` weight:
+
+```
+blended = alpha_new × new_result + (1 − alpha_new) × previous_result
+```
+
+The current value is `alpha_new = 0.7` (new-frame weight). This value was tuned after live testing:
+
+| `alpha_new` | Effect |
+|---|---|
+| Low (e.g. 0.45, previous default) | Smoother transitions, but causes visible ghosting and double-edges on movement |
+| **0.7 (current)** | Less ghosting on movement, but more noticeable per-step change ("pop") |
+| High (approaching 1.0) | Effectively no blending — maximum sharpness, maximum per-step jump |
+
+The periodic ~3 s "pop" visible in live use is a direct consequence of `alpha_new = 0.7` combined with the 3 s capture interval. See [Known Limitations](#known-limitations) for the three independent levers available to reduce it.
+
+## Frame Dropping
+
+Only one diffusion inference runs at a time per WebSocket connection. If a new `frame` message arrives while the previous inference is still running, the server immediately responds with `{"type": "dropped"}` and discards the incoming frame. This prevents stale frames from queuing up and keeps latency bounded. The Flutter client's 3-second send interval is calibrated to the ~3 s round-trip time on an A10G GPU, so drops should be rare under normal conditions.
+
+## Performance
+
+| Stage | Typical latency (A10G GPU) |
+|---|---|
+| JPEG decode (CPU) | ~10–30 ms |
+| CatVTON diffusion inference (GPU) | ~2,500–3,000 ms |
+| JPEG encode (CPU, 4:4:4, quality 88) | ~20–50 ms |
+| **Total round-trip** | **~2,600–3,100 ms** |
+
+The server logs per-frame latency at `INFO` level:
+
+```
+[lat] decode=18ms infer=2741ms encode=31ms total=2790ms fps=0.36
+```
+
+Two threads are allocated to the worker pool — one for GPU inference and one for JPEG encode/decode overlap (`ThreadPoolExecutor(max_workers=2)`). The async event loop is never blocked; inference is dispatched with `loop.run_in_executor`.
+
+## Known Limitations
+
+The following issues are confirmed from live testing (as of 2026-09-03) and are not yet fixed:
+
+1. **DWPose pose conditioning is disabled.** At startup the model logs:
+   ```
+   DWPose failed to load, running without pose conditioning:
+   module 'mediapipe' has no attribute 'solutions'
+   ```
+   This is the same `mediapipe` legacy-API breakage already fixed in
+   `face_swap_backend` (commit `1dfca03`, migrated to `mediapipe.tasks`), but
+   **not yet applied to `tryon_backend`**. Without DWPose the pipeline falls
+   back to vanilla img2img with no pose conditioning, which means garment
+   placement does not adapt well to body rotation or non-frontal poses.
+   Complication: face-swap and try-on share one conda environment, so a
+   `mediapipe` version change would affect the already-fixed face-swap backend;
+   and the loader is third-party (`controlnet_aux`'s `DWposeDetector`), not
+   Mirror Fit's own code. Parked pending a decision on the shared-env risk.
+
+2. **Fabric overlay sits too high on the neck.** There is an 80 px fade-in
+   ramp in `model.py` (lines 1912–1926) intended to push the fabric pattern
+   down to the collarbone instead of the chin. The gap is a **fixed 80 px
+   regardless of framing**, so when the camera is close (face fills a large
+   fraction of the frame) 80 px is proportionally too small. Proposed fix:
+   make the gap proportional to the detected face height. Not yet applied.
+
+3. **Periodic ~3 s pop per generation cycle.** Each 3-second capture-and-infer
+   cycle produces a visibly discrete update in the output. Three independent
+   levers exist (lowest to highest risk):
+   - **Increase the CSS crossfade duration** (currently 0.6 s transition in
+     the embedded HTML) — spreads the same change over more time without
+     touching the diffusion blend.
+   - **Shorten the 3 s capture interval** — smaller change per step; costs
+     more GPU load per session.
+   - **Re-tune `alpha_new`** — highest risk, re-opens an already-fought
+     tradeoff between ghosting and pop.
+
+<Warning>
+  DWPose is currently disabled. Garment placement does not adapt to body
+  rotation, sideways poses, or significant forward lean until this is fixed.
+  For best results, face the camera directly with shoulders square to the lens.
+</Warning>
+
+## Flutter Client Pattern
+
+The Flutter client embeds a self-contained HTML page inside an `InAppWebView`. That page opens the WebSocket, streams camera frames via a JavaScript `setInterval`-style loop, and renders returned frames onto an `<img>` element with a CSS opacity transition. Below is a simplified version of the connection and streaming logic from `decart_realtime_screen.dart`:
+
+```dart
+// Resolve backend URL, convert http:// → ws://, append /ws/tryon
+Future<void> _initBackendThenStart() async {
+  final saved = await ColabTryOnService.getSavedUrl();
+  final base  = (saved != null && saved.trim().isNotEmpty)
+      ? saved
+      : 'http://13.126.77.241:8000'; // default EC2 host
+  _backendWsUrl = _toWsUrl(base);
+
+  final html = _buildHtml(widget.garmentUrl, widget.garmentName, _backendWsUrl);
+  _htmlToLoad = html;
+  _loadTryonPage();
+}
+
+// Inside the embedded HTML page (JavaScript):
+//
+// 1. Open camera stream via getUserMedia
+// 2. Connect WebSocket → on open, send init message with garment base64
+// 3. On "ready" response, start the 3-second capture loop
+// 4. On "result" response, set <img>.src and fade it in
+
+ws.onopen = async () => {
+  const garmentB64 = await urlToBase64(GARMENT_URL);
+  ws.send(JSON.stringify({
+    type:          'init',
+    garment_image: garmentB64,
+  }));
+};
+
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+
+  if (msg.type === 'ready') {
+    // Start sending frames every 3 seconds
+    startCapturing();
+
+  } else if (msg.type === 'result') {
+    resultEl.src = 'data:image/jpeg;base64,' + msg.image;
+    resultEl.classList.add('show'); // triggers 0.6s CSS opacity transition
+  }
+};
+
+// Capture loop — one frame every 3 000 ms
+async function startCapturing() {
+  while (capturing && wsReady) {
+    const frame = captureFrame(); // draws mirrored video to canvas, returns base64 JPEG
+    ws.send(JSON.stringify({ type: 'frame', image: frame }));
+    await new Promise(r => setTimeout(r, 3000));
+  }
+}
+```
+
+The WebSocket is torn down when the Flutter widget is disposed by calling `window.decartStop()` via `evaluateJavascript`, which closes the socket and stops all camera tracks:
+
+```dart
+@override
+void dispose() {
+  try {
+    _webCtrl?.evaluateJavascript(source: 'window.decartStop?.()');
+  } catch (_) { /* webview already torn down */ }
+  _liveCtrl.dispose();
+  super.dispose();
+}
+```

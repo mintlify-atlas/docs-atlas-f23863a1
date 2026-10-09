@@ -1,0 +1,217 @@
+---
+title: "Real-Time AR Try-On Pipeline Internals"
+sidebarTitle: "AR Pipeline"
+description: "How Mirror Fit's per-frame pipeline processes camera images through pose detection, body segmentation, dimension estimation, and compositing."
+---
+
+Mirror Fit's AR pipeline runs entirely on-device, processing every camera frame at a target rate of 30 FPS with no cloud calls required. Each frame travels through five sequential stages — camera capture, pose detection, body segmentation, dimension estimation, garment fitting, and compositing — and the result is painted by a `CustomPainter` directly onto the camera preview. The pipeline is orchestrated by `TryOnPipeline extends ChangeNotifier`, which connects all stages and notifies the UI layer when a new `PipelineFrame` is ready.
+
+<Note>
+`google_mlkit_pose_detection` and `tflite_flutter` are currently **commented out** in `pubspec.yaml` because they crash on iOS 26 beta. Both packages are present in the code as stubs that return `null`. To enable the full pipeline on a stable iOS or Android device, uncomment the two lines in `pubspec.yaml`, run `flutter pub get`, and re-enable the real implementations in `pose_detector_service.dart` and `body_segmenter.dart`. The fitting, occlusion, and rendering stages all work without these packages when you supply pose data from an alternative source.
+</Note>
+
+---
+
+## Per-Frame Processing Sequence
+
+<Steps>
+  <Step title="Camera capture">
+    `CameraService` delivers a raw `CameraImage` at ~30 FPS. On Android the frame is YUV420; on iOS it is BGRA8888. The camera operates at `ResolutionPreset.medium` (480×640 portrait). The capture stage itself takes ~0 ms because it is a hardware callback.
+  </Step>
+  <Step title="Pose detection">
+    `PoseDetectorService` receives the `CameraImage` and runs Google MLKit Pose Detection. It returns a `PoseResult` carrying 33 `Landmark` objects (x, y, z, confidence). EMA smoothing at factor 0.7 is applied to suppress jitter. If the pipeline is still processing the previous frame, the new frame is dropped rather than queued. Target: ~15 ms.
+  </Step>
+  <Step title="Body segmentation">
+    `BodySegmenter` runs the MediaPipe Selfie Segmentation TFLite model at 256×256. The GPU delegate accelerates inference 3–5× versus CPU. Output is a `SegmentationMask` (one byte per pixel: 0 = background, 255 = body). Target: ~10 ms.
+  </Step>
+  <Step title="Dimension estimation">
+    `BodyDimensionEstimator` computes shoulder width, torso height, arm lengths, hip width, and body angle from the `PoseResult` in pure Dart with no ML. A 3-frame weighted-average smooths measurements across frames. Target: ~1 ms.
+  </Step>
+  <Step title="Garment fitting">
+    `GarmentFitter` maps the `BodyDimensions` and shoulder landmarks to a `GarmentTransform` (position, scale, rotation). Light EMA smoothing (`alpha = 0.20`) is applied on top of landmark-level filtering. Target: ~1 ms.
+  </Step>
+  <Step title="Compositing">
+    `GarmentOverlayPainter` (a `CustomPainter`) draws the garment onto the camera preview using `Canvas.saveLayer` + `BlendMode.dstIn` to clip the garment to the body silhouette, then `BlendMode.dstOut` to punch arm holes through the garment layer. Target: ~2 ms.
+  </Step>
+</Steps>
+
+**Total per-frame budget: ~25–30 ms → 30–40 FPS.**
+
+---
+
+## Camera Service
+
+`CameraService` (`camera/camera_service.dart`) handles camera initialisation and frame streaming.
+
+```dart
+// Initialise front camera at 480p in portrait orientation.
+final service = CameraService();
+await service.initialize(useFrontCamera: true);
+
+// Start streaming — called for every camera frame.
+await service.startFrameStream((CameraImage image) {
+  // Process quickly or drop the frame.
+});
+
+// Toggle between front and back camera mid-stream.
+await service.switchCamera();
+```
+
+**Key configuration details:**
+
+- **Resolution:** `ResolutionPreset.medium` — 640×480 landscape, 480×640 portrait. Chosen for ML performance balance; 1080p roughly triples inference time.
+- **Image format:** `ImageFormatGroup.yuv420` on Android (Y, U, V planes), `ImageFormatGroup.bgra8888` on iOS (interleaved BGRA).
+- **Orientation:** `lockCaptureOrientation(DeviceOrientation.portraitUp)` ensures consistent landmark coordinates across devices.
+- **FPS tracking:** Resets the frame counter every 1000 ms; exposes `currentFps` for the debug overlay.
+
+**Frame-to-bytes conversion:**
+
+```dart
+// Fast Y-plane extraction for pose detection (grayscale, sufficient for MLKit).
+final gray = CameraService.extractYPlane(cameraImage);
+
+// Full NV21 interleaved bytes for MLKit on Android.
+final nv21 = CameraService.getNv21Bytes(cameraImage);
+```
+
+On iOS (BGRA8888), `extractYPlane` manually converts to grayscale respecting the `bytesPerRow` stride: `gray = (R + G + G + B) >> 2` per pixel.
+
+---
+
+## Pose Detection
+
+`PoseDetectorService` (`pose/pose_detector_service.dart`) wraps **Google MLKit Pose Detection** (MediaPipe under the hood) and delivers 33 body landmarks per frame.
+
+**Landmark set:** All 33 MediaPipe Pose landmarks are typed via the `LandmarkType` enum, including:
+
+| Index | Name | Used for |
+|-------|------|----------|
+| 11 | `leftShoulder` | Garment anchor, shoulder width |
+| 12 | `rightShoulder` | Garment anchor, shoulder width |
+| 13 | `leftElbow` | Arm length, sleeve deformation |
+| 14 | `rightElbow` | Arm length, sleeve deformation |
+| 15 | `leftWrist` | Arm length, occlusion |
+| 16 | `rightWrist` | Arm length, occlusion |
+| 23 | `leftHip` | Torso height, hip width |
+| 24 | `rightHip` | Torso height, hip width |
+| 25 | `leftKnee` | Full-body garment height |
+| 26 | `rightKnee` | Full-body garment height |
+
+**Stream mode** is used rather than single-image mode so that MLKit maintains temporal context between frames, improving landmark stability.
+
+**EMA smoothing** is applied per landmark:
+
+```
+smoothed_x = prev_x × (1 - 0.7) + new_x × 0.7
+smoothed_y = prev_y × (1 - 0.7) + new_y × 0.7
+```
+
+**Frame dropping:** If `_isProcessing` is `true` when a new `CameraImage` arrives, the frame is skipped entirely rather than added to a queue. This prevents latency accumulation at the cost of occasionally missing a frame, which is preferable for a real-time try-on experience.
+
+---
+
+## Body Segmentation
+
+`BodySegmenter` (`segmentation/body_segmenter.dart`) runs the **MediaPipe Selfie Segmentation** model via TensorFlow Lite.
+
+**Model details:**
+- File: `assets/ml_models/selfie_segmentation.tflite`
+- Input: 256×256 RGB
+- Output: 256×256 probability mask (0 = background, 255 = body)
+- Size: ~300 KB (fast model) or ~2.7 MB (`deeplabv3_257_mv_gpu.tflite`, more accurate)
+
+**GPU delegate:** Enabled on both platforms for 3–5× speedup over CPU inference:
+- Android: `GpuDelegateV2` (OpenCL)
+- iOS: `GpuDelegate` (Metal)
+- Fallback: NNAPI (Android) or CoreML (iOS)
+
+**`SegmentationMask` API:**
+
+```dart
+class SegmentationMask {
+  final Uint8List data;   // width × height bytes
+  final int width;        // 256
+  final int height;       // 256
+
+  // Returns raw byte value (0–255) at (x, y).
+  int valueAt(int x, int y);
+
+  // true if pixel is body (value > threshold).
+  bool isForeground(int x, int y, {int threshold = 128});
+}
+```
+
+The mask is used in two places: by `GarmentOverlayPainter` as a `BlendMode.dstIn` silhouette clip (jacket appears "worn on body"), and by `OcclusionHandler` to identify arm pixels that should render over the garment.
+
+---
+
+## Dimension Estimation
+
+`BodyDimensionEstimator` (`body/body_dimension_estimator.dart`) derives pixel-space body measurements from `PoseResult` landmarks using pure Dart geometry.
+
+| Measurement | Calculation |
+|---|---|
+| Shoulder width | `distance2D(leftShoulder, rightShoulder)` |
+| Torso height | `distance(shoulderCenter, hipCenter)` — or `shoulderWidth × 1.4` if hips not visible |
+| Arm length (left) | `distance2D(leftShoulder, leftElbow) + distance2D(leftElbow, leftWrist)` |
+| Arm length (right) | `distance2D(rightShoulder, rightElbow) + distance2D(rightElbow, rightWrist)` |
+| Hip width | `distance2D(leftHip, rightHip)` — or `shoulderWidth × 0.85` if hips not visible |
+| Body angle | `atan2(leftShoulder.z − rightShoulder.z, shoulderWidth)`, clamped to ±45° |
+
+**Temporal smoothing:** A 3-entry history buffer applies a linearly weighted average where the most recent frame receives weight 3, the previous frame weight 2, and the oldest frame weight 1. This gives a 5-frame effective window without introducing noticeable lag.
+
+```dart
+// Usage
+final estimator = BodyDimensionEstimator();
+final dims = estimator.estimate(poseResult); // returns null if shoulders absent
+
+// Garment scale helpers
+final scale = estimator.computeGarmentScale(
+  body: dims!,
+  garmentOrigWidth: 600,
+  garmentOrigHeight: 800,
+  shoulderPaddingFactor: 1.2,
+);
+// scale.scaleX, scale.scaleY
+
+final anchor = estimator.computeGarmentAnchor(poseResult);
+// Offset at shoulder midpoint, shifted up 5% of torso height for neckline
+```
+
+---
+
+## Occlusion Handling
+
+`OcclusionHandler` (`occlusion/occlusion_handler.dart`) detects when a user's arm crosses in front of the virtual garment and ensures the arm renders on top, maintaining visual realism.
+
+**Algorithm:**
+
+1. Compute average torso z-depth from the four shoulder and hip landmarks.
+2. For each arm (left and right), check if `elbow.z < torsoZ - 0.05` or `wrist.z < torsoZ - 0.05`. In MediaPipe, smaller z = closer to the camera.
+3. If the arm is occluding, build an arm path from shoulder → elbow → wrist with a 35 px radius capsule.
+4. Cross-reference with the segmentation mask (`isForeground(x, y, threshold: 100)`) to restrict the occlusion area to actual body pixels.
+5. Write `255` into the occlusion mask at pixels where the arm should render over the garment.
+
+**Render order (painter's algorithm):**
+
+```
+Camera feed        depth 2.0  → drawn first  (background)
+  ↓
+Garment overlay    depth 1.0  → drawn second (middle layer)
+  ↓
+Occluding arms     depth 0.5  → drawn last   (foreground, from camera feed)
+```
+
+`GarmentOverlayPainter` implements this via `Canvas.saveLayer` + `BlendMode.dstOut`: the arm path is painted with `dstOut` inside the layer, erasing the garment pixels there so the camera feed beneath shows through.
+
+---
+
+## Data Flow Diagram
+
+```
+CameraFrame → PoseResult → BodyDimensions → GarmentTransform
+    ↓              ↓                              ↓
+SegmentationMask  Landmarks                  ScaledModel
+    ↓              ↓                              ↓
+OcclusionMask → CompositeRenderer → Final Output Frame
+```

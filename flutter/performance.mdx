@@ -1,0 +1,212 @@
+---
+title: "Performance Optimisation and Adaptive Quality"
+sidebarTitle: "Performance"
+description: "How Mirror Fit's adaptive quality system adjusts segmentation, pose model accuracy, and camera resolution to maintain 30 FPS on mid-range devices."
+---
+
+All ML processing in Mirror Fit runs on-device — there are no network calls in the AR hot path. Achievable frame rates vary significantly between devices: a flagship phone can run the full pipeline with segmentation, occlusion, and accurate pose at 40+ FPS, while a mid-range device from 2020 may struggle to sustain 30 FPS with all features enabled. The `PerformanceMonitor` class (`core/performance_optimizer.dart`) tracks a 30-frame sliding window of per-stage timings and automatically degrades quality features to keep the experience usable as FPS drops.
+
+<Note>
+Target mid-range Android devices (Snapdragon 665 or equivalent, ~2019–2021) for your 30 FPS baseline. These are the most common phones in the mirror-try-on demographic. Flagship devices (Snapdragon 8 Gen 2, Apple A17) run the full pipeline with significant headroom. Below Snapdragon 665, use the Minimal quality preset (pose only, 240p input) to maintain a responsive, lag-free preview.
+</Note>
+
+---
+
+## Quality Levels
+
+`PerformanceMonitor` maps the current rolling-average FPS to one of four `QualityLevel` values and returns the corresponding `QualitySettings`.
+
+| FPS Range | Quality Level | Features |
+|-----------|--------------|----------|
+| ≥ 30 FPS | `high` | Segmentation enabled · Occlusion enabled · Accurate pose model · 480p input · 5-frame smoothing |
+| 20–30 FPS | `medium` | Segmentation enabled · Occlusion **disabled** · Base pose model · 480p input · 3-frame smoothing |
+| 15–20 FPS | `low` | Segmentation **disabled** · Occlusion disabled · Base pose model · **360p** input · 3-frame smoothing |
+| < 15 FPS | `minimal` | Segmentation disabled · Occlusion disabled · Base pose model · **240p** input · 2-frame smoothing |
+
+```dart
+// Reading the current quality recommendation
+final monitor = PerformanceMonitor();
+
+// Record a frame after processing
+monitor.recordFrame(
+  poseDetectionMs: 15,
+  segmentationMs:  10,
+  fittingMs:        1,
+  renderingMs:      2,
+);
+
+// Fetch recommended settings
+final settings = monitor.getRecommendedSettings();
+print(settings.enableSegmentation); // true at high/medium
+print(settings.inputResolution);    // 480 / 360 / 240
+
+// Query current quality enum
+print(monitor.currentQuality);      // QualityLevel.high
+print(monitor.averageFps);          // Rolling 30-frame average
+```
+
+---
+
+## Per-Frame Timing Target
+
+The full pipeline is designed to complete in 25–30 ms, matching a 30–40 FPS display budget.
+
+| Stage | Target time | Implementation |
+|-------|------------|---------------|
+| Camera capture | ~0 ms | `camera` package hardware callback |
+| Pose detection | ~15 ms | MediaPipe via `google_mlkit_pose_detection` |
+| Body segmentation | ~10 ms | TFLite + GPU delegate |
+| Dimension estimation | ~1 ms | Pure Dart math in `BodyDimensionEstimator` |
+| Garment fitting | ~1 ms | Pure Dart math in `GarmentFitter` |
+| Compositing | ~2 ms | Flutter `CustomPainter` + `Canvas.drawVertices` |
+| **Total** | **~25–30 ms** | **= 30–40 FPS** |
+
+The resolution comparison shows why 480p is chosen over higher resolutions:
+
+| Resolution | Pose detection | Segmentation | Total |
+|------------|---------------|--------------|-------|
+| 1080p | ~45 ms | ~35 ms | ~80 ms |
+| 720p | ~25 ms | ~20 ms | ~45 ms |
+| **480p** | **~15 ms** | **~12 ms** | **~27 ms ✓** |
+| 360p | ~10 ms | ~8 ms | ~18 ms |
+
+---
+
+## Key Optimisation Strategies
+
+<CardGroup cols={2}>
+  <Card title="GPU Delegate for TFLite" icon="microchip">
+    The TFLite body segmentation model runs on the **GPU delegate** (OpenCL on Android, Metal on iOS) giving 3–5× speedup over CPU inference. Fallback order: GpuDelegateV2 → NNAPI (Android) or GpuDelegate → CoreML (iOS). Enabled in `BodySegmenter.initialize()`.
+  </Card>
+  <Card title="Frame Dropping" icon="arrow-down-to-line">
+    If the pipeline is still processing the previous frame when a new `CameraImage` arrives, the new frame is **dropped** rather than queued. This prevents latency accumulation that would make the garment visibly lag behind body movement.
+  </Card>
+  <Card title="480p Camera Resolution" icon="camera">
+    `CameraService` uses `ResolutionPreset.medium` (640×480). At 1080p, combined ML inference takes ~80 ms — well below 30 FPS. 480p brings this to ~27 ms while still providing sufficient resolution for pose landmark accuracy.
+  </Card>
+  <Card title="Frame Rate Limiter" icon="gauge-high">
+    `FrameRateLimiter` caps processing at a target FPS (default 30). `shouldProcessFrame()` returns `false` until `1000 / targetFps` ms have elapsed since the last processed frame, preventing the GPU from being overloaded on high-refresh displays.
+  </Card>
+  <Card title="EMA Tracking (30-frame window)" icon="chart-line">
+    `PerformanceMonitor` maintains a `Queue<FrameTiming>` capped at 30 entries. Average FPS is computed as `1000 / avgMs`. Quality decisions are made against this smoothed signal, not instantaneous FPS, to avoid rapid oscillation between quality levels.
+  </Card>
+  <Card title="Buffer Reuse" icon="recycle">
+    TFLite input and output buffers are allocated once at model load time and reused every frame. `CameraImage` objects are released immediately after the byte data is extracted. The segmentation mask history is limited to 3 frames.
+  </Card>
+</CardGroup>
+
+---
+
+## PerformanceMonitor API
+
+```dart
+class PerformanceMonitor {
+  /// Current quality level, updated after every recorded frame.
+  QualityLevel get currentQuality;
+
+  /// Rolling average FPS across the last 30 frames.
+  double get averageFps;
+
+  /// Record one frame's timing breakdown.
+  void recordFrame({
+    required int poseDetectionMs,
+    required int segmentationMs,
+    required int fittingMs,
+    required int renderingMs,
+  });
+
+  /// Average time per stage across the current window.
+  Map<String, double> get averageTimings;
+  // Keys: 'pose_ms', 'segment_ms', 'fitting_ms', 'rendering_ms', 'total_ms'
+
+  /// Returns QualitySettings for the current quality level.
+  QualitySettings getRecommendedSettings();
+}
+
+class QualitySettings {
+  final bool enableSegmentation;
+  final bool enableOcclusion;
+  final bool poseModelAccurate;
+  final int  inputResolution;    // 480, 360, or 240
+  final int  smoothingFrames;    // 5, 3, 3, or 2
+}
+
+class FrameRateLimiter {
+  FrameRateLimiter({int targetFps = 30});
+
+  /// Returns true only when enough time has elapsed for the next frame.
+  bool shouldProcessFrame();
+}
+```
+
+---
+
+## GPU Delegate Setup
+
+The TFLite GPU delegate is configured inside `BodySegmenter.initialize()`:
+
+```dart
+// Android — GpuDelegateV2 (OpenCL)
+final gpuDelegate = GpuDelegateV2(
+  options: GpuDelegateOptionsV2(
+    isPrecisionLossAllowed: true,    // fp16 inference — faster, minimal quality loss
+    inferencePreference: TfLiteGpuInferenceUsage.fastSingleAnswer,
+    inferencePriority1: TfLiteGpuInferencePriority.minLatency,
+  ),
+);
+
+// iOS — GpuDelegate (Metal)
+final gpuDelegate = GpuDelegate(
+  options: GpuDelegateOptions(allowPrecisionLoss: true),
+);
+
+final interpreterOptions = InterpreterOptions()
+  ..addDelegate(gpuDelegate);
+
+_interpreter = await Interpreter.fromAsset(
+  modelPath,
+  options: interpreterOptions,
+);
+```
+
+The `isPrecisionLossAllowed: true` flag enables FP16 inference on the GPU, which is the primary source of the 3–5× improvement. For the 256×256 segmentation model this causes no perceptible quality loss on body masks.
+
+**Fallback delegates** (applied automatically when GPU is unavailable):
+- Android: `NnApiDelegate` (hardware ML accelerator on Android 8.1+)
+- iOS: `CoreMlDelegate` (Apple Neural Engine on A11+)
+- Both: CPU interpreter if no accelerator is available
+
+---
+
+## Adaptive Quality in Practice
+
+The pipeline reads `QualitySettings` at the start of each frame and gates features accordingly:
+
+```dart
+final settings = _performanceMonitor.getRecommendedSettings();
+
+// Gate segmentation
+SegmentationMask? mask;
+if (settings.enableSegmentation && _segmenter.isInitialized) {
+  mask = await _segmenter.segment(cameraImage);
+}
+
+// Gate occlusion mask generation
+List<RenderLayer>? layers;
+if (settings.enableOcclusion && mask != null) {
+  layers = _occlusionHandler.computeRenderOrder(
+    pose: pose, segMask: mask,
+    garmentTransform: transform, garmentBounds: bounds,
+  );
+}
+
+// Adjust pose model accuracy
+final poseOptions = PoseDetectorOptions(
+  model: settings.poseModelAccurate
+      ? PoseDetectionModel.accurate
+      : PoseDetectionModel.base,
+  mode: PoseDetectionMode.stream,
+);
+```
+
+When quality drops from `high` to `medium`, occlusion is the first feature disabled because its mask-generation loop is O(pixels). Segmentation is retained at `medium` because it drives the body silhouette clip that makes the garment look "worn on" rather than "floating in front of". At `low` and `minimal`, the pipeline falls back to geometric-only fitting with no pixel-accurate clipping.

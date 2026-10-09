@@ -1,0 +1,265 @@
+---
+title: "3D Garment Rendering: model_viewer_plus and Unity"
+sidebarTitle: "3D Rendering"
+description: "Loading and rendering .glb garment models in Mirror Fit using model_viewer_plus for simple overlay and flutter_unity_widget for full 3D compositing."
+---
+
+Mirror Fit supports two rendering backends for 3D garments. The first — `model_viewer_plus` — requires no native configuration and is the fastest path to displaying a `.glb` file in-app: it spins up a WebGL viewer in a platform WebView, supports pan/zoom/rotate, and can launch AR Quick Look (iOS) or Scene Viewer (Android) for a full AR experience. The second — `flutter_unity_widget` — embeds a live Unity render surface inside Flutter, enabling GPU-accelerated shaders, proper depth compositing, and real-time per-frame transform updates driven by the pose pipeline. Choose `model_viewer_plus` first to verify your garment assets; upgrade to Unity when you need cloth simulation or photorealistic rendering.
+
+<Tabs>
+  <Tab title="Option A: model_viewer_plus">
+
+## model_viewer_plus
+
+`model_viewer_plus` is active in `pubspec.yaml` today and requires no additional platform configuration. It renders `.glb` and `.gltf` files via a `<model-viewer>` web component inside a platform WebView.
+
+```yaml
+# pubspec.yaml (already present)
+dependencies:
+  model_viewer_plus: ^1.8.1
+```
+
+**Capabilities:**
+- Loads `.glb` / `.gltf` directly from assets or file paths
+- Pan, zoom, and rotate gestures out of the box
+- **AR Quick Look** on iOS (native ARKit viewer, tap the AR button)
+- **Scene Viewer** on Android (ARCore-powered AR preview)
+- Lighting environments (IBL, HDR background)
+- Annotation hotspots and variant switching via HTML attributes
+
+**Loading a garment from assets:**
+
+```dart
+import 'package:model_viewer_plus/model_viewer_plus.dart';
+
+// Static 3D product preview screen.
+class ModelPreviewScreen extends StatelessWidget {
+  final String garmentAssetPath; // e.g. 'assets/models/jacket.glb'
+  const ModelPreviewScreen({super.key, required this.garmentAssetPath});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(title: const Text('3D Preview')),
+      body: ModelViewer(
+        src: garmentAssetPath,          // Asset path or file:// URL
+        alt: 'A 3D garment model',
+        ar: true,                        // Enable AR Quick Look / Scene Viewer
+        autoRotate: true,
+        cameraControls: true,
+        backgroundColor: Colors.transparent,
+      ),
+    );
+  }
+}
+```
+
+**Loading from a local file (after copying from assets):**
+
+```dart
+import 'package:lucy_tryon/ar_tryon/rendering/model_loader.dart';
+
+// Copy asset to documents directory first — model_viewer_plus needs file:// or http://.
+final filePath = await ModelLoader.loadFromAsset('assets/models/jacket.glb');
+
+ModelViewer(
+  src: 'file://$filePath',
+  ar: true,
+  autoRotate: false,
+  cameraControls: true,
+)
+```
+
+`ModelLoader.loadFromAsset()` writes only when the file is absent or the byte length has changed, so subsequent loads are instant.
+
+**Garment file size targets:**
+
+| Garment | Target polygons | Target file size |
+|---------|----------------|-----------------|
+| T-Shirt | 5K–15K | 200 KB–500 KB |
+| Button shirt | 10K–25K | 300 KB–1 MB |
+| Jacket | 15K–35K | 500 KB–2 MB |
+| Dress | 15K–40K | 500 KB–2 MB |
+| Full suit | 25K–50K | 1 MB–3 MB |
+
+  </Tab>
+  <Tab title="Option B: flutter_unity_widget">
+
+## flutter_unity_widget
+
+`flutter_unity_widget` embeds a Unity render surface directly into the Flutter widget tree. The Flutter side runs the pose and fitting pipeline; Unity handles GPU-accelerated 3D rendering, shaders, and depth compositing. The two sides communicate via JSON messages.
+
+```yaml
+# pubspec.yaml — uncomment when Unity project is ready
+# flutter_unity_widget: ^2022.2.1
+```
+
+**Requirements:**
+1. Unity 2022 LTS with AR Foundation installed
+2. Build Unity as an Android Library (`.aar`) or iOS Framework (`.framework`)
+3. Link the built artifact into the Flutter host app
+
+**Flutter widget setup:**
+
+```dart
+import 'package:flutter_unity_widget/flutter_unity_widget.dart';
+import 'package:lucy_tryon/ar_tryon/unity_bridge/unity_bridge.dart';
+
+class ARWithUnityScreen extends StatefulWidget {
+  const ARWithUnityScreen({super.key});
+  @override
+  State<ARWithUnityScreen> createState() => _ARWithUnityScreenState();
+}
+
+class _ARWithUnityScreenState extends State<ARWithUnityScreen> {
+  UnityBridgeController? _bridge;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: UnityWidget(
+        onUnityCreated: (controller) {
+          setState(() {
+            _bridge = UnityBridgeController(controller);
+          });
+        },
+        onUnityMessage: (message) {
+          _bridge?.handleMessage(message);
+        },
+        fullscreen: false,
+      ),
+    );
+  }
+}
+```
+
+**Sending a per-frame transform update:**
+
+```dart
+// Called each frame from the pose pipeline result.
+_bridge?.updateGarmentTransform(
+  modelPath: 'tshirt.glb',
+  x: transform.x / viewportWidth,     // Normalised 0–1
+  y: transform.y / viewportHeight,
+  scaleX: transform.scaleX,
+  scaleY: transform.scaleY,
+  rotationY: transform.rotationDegrees,
+);
+```
+
+**Loading a model by name:**
+
+```dart
+_bridge?.loadModel('jacket_001.glb');
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Flutter ↔ Unity Message Format
+
+All communication between Flutter and Unity is JSON encoded as strings.
+
+**Flutter → Unity (per frame):**
+
+```json
+{
+  "type": "update_transform",
+  "model": "tshirt.glb",
+  "transform": {
+    "position": { "x": 0.5, "y": 0.3, "z": 0 },
+    "rotation": { "x": 0, "y": 15, "z": 0 },
+    "scale":    { "x": 1.2, "y": 1.1, "z": 1.0 }
+  },
+  "landmarks": {
+    "left_shoulder":  { "x": 0.3, "y": 0.25, "z": 0 },
+    "right_shoulder": { "x": 0.7, "y": 0.24, "z": 0 }
+  }
+}
+```
+
+**Flutter → Unity (load model):**
+
+```json
+{ "type": "load_model", "model": "jacket_001.glb" }
+```
+
+**Unity → Flutter (render complete):**
+
+```json
+{
+  "type": "render_complete",
+  "frame_id": 42,
+  "render_time_ms": 8
+}
+```
+
+**Unity → Flutter (ready signal):**
+
+```json
+{ "type": "ready" }
+```
+
+`UnityBridgeController.handleMessage()` parses incoming messages and logs a warning when `render_time_ms > 16` (missing 60 FPS target).
+
+---
+
+## Unity Bridge
+
+`UnityBridgeController` (`unity_bridge/unity_bridge.dart`) wraps `flutter_unity_widget`'s `postMessage` API with type-safe Dart classes.
+
+```dart
+class UnityBridgeController {
+  bool get isReady;
+
+  void loadModel(String modelPath);
+
+  void updateGarmentTransform({
+    required String modelPath,
+    required double x,
+    required double y,
+    required double scaleX,
+    required double scaleY,
+    required double rotationY,
+  });
+
+  void updateOcclusionMask(List<int> maskData, int width, int height);
+
+  void handleMessage(dynamic message);
+
+  void dispose();
+}
+```
+
+Messages are sent to a Unity `GameObject` named `"GarmentController"`, calling its `"OnFlutterMessage"` method. The `unity_bridge.dart` file contains a complete, ready-to-use `GarmentController.cs` Unity C# script as a doc comment — copy it into your Unity project's `Assets/Scripts/` directory. The script uses `JsonUtility.FromJson<GarmentMessage>()` to parse incoming messages and calls `Camera.main.ScreenToWorldPoint()` to convert the 2D normalised position into a 3D world coordinate.
+
+<Tip>
+`model_viewer_plus` is strongly recommended for getting started — you can see your `.glb` garment on screen in under an hour with no native toolchain changes. Switch to `flutter_unity_widget` once you have confirmed your garment assets look correct and you need cloth shaders or physics simulation.
+</Tip>
+
+---
+
+## Blender Export Checklist
+
+Mirror Fit expects `.glb` files exported from Blender with these settings:
+
+```
+File → Export → glTF 2.0 (.glb)
+
+Format:       glTF Binary (.glb)        ← single self-contained file
+Include:      ☑ Selected Objects only
+Transform:    ☑ +Y Up
+Mesh:         ☑ Apply Modifiers
+              ☑ UVs
+              ☑ Normals
+              ☐ Tangents                 ← skip on mobile
+Material:     ☑ Materials (PBR)
+              Image: JPEG (opaque) or PNG (transparent regions)
+Animation:    ☐                          ← skip unless cloth simulation
+Compression:  ☑ Draco                   ← 60–80% file size reduction
+```
+
+Use the Decimate modifier to stay within the polygon budget. Remove interior faces and merge vertices by distance (0.001 m) before export.

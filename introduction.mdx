@@ -1,0 +1,61 @@
+---
+title: "Mirror Fit: Open-Source Virtual Try-On for Flutter"
+sidebarTitle: "Introduction"
+description: "Mirror Fit is a Flutter app with real-time AR garment overlay, AI avatar generation, fit scoring, and returns-risk analysis — all on open-source tooling."
+---
+
+Mirror Fit is a Flutter-based real-time virtual try-on platform that lets shoppers see clothes on their body through their phone camera — before buying. It replaces the guesswork of online shopping with a live AR mirror: a 30 FPS on-device pipeline detects your pose, measures your body, and drapes a scaled 3D garment over you with correct rotation and occlusion. For cases where photorealism matters more than speed, Mirror Fit also ships self-hosted GPU backends that run AI-powered face swap, diffusion-based garment generation, and AI twin video — all without a single paid API call.
+
+<CardGroup cols={2}>
+  <Card title="Real-Time AR Try-On" icon="camera">
+    A per-frame pipeline — Camera → Pose Detection → Body Segmentation → Garment Fitting → Occlusion → Composite Renderer — runs entirely on-device at 30–40 FPS. No cloud round-trips, no latency.
+  </Card>
+  <Card title="AI Avatar Generation" icon="user-circle">
+    The `face_swap_backend` uses InsightFace to swap the user's face onto curated base-body photographs, producing a personalized avatar for garment previews. Live WebSocket streaming enables real-time face swap at low latency.
+  </Card>
+  <Card title="Fit Scoring Engine" icon="ruler">
+    Body dimensions extracted from MediaPipe's 33-landmark skeleton — shoulder width, torso height, hip width, arm lengths — are fed into a fit scoring module that computes a `fit_mismatch_score` between measured dimensions and garment specifications.
+  </Card>
+  <Card title="Returns-Risk Analysis" icon="shield-check">
+    A dedicated `returns_risk` module ingests the fit score and garment metadata to predict the likelihood of a return before checkout — helping retailers surface size recommendations and reduce reverse-logistics costs.
+  </Card>
+</CardGroup>
+
+## Core Technologies
+
+Mirror Fit is built entirely on open-source tooling. No vendor lock-in, no metered inference APIs.
+
+| Layer | Technology | Role |
+|---|---|---|
+| **Mobile framework** | Flutter / Dart (`sdk: ^3.10.1`) | Cross-platform app, camera stream, rendering |
+| **Pose detection** | Google MLKit / MediaPipe | 33-landmark skeleton at 30 FPS |
+| **Body segmentation** | TensorFlow Lite (GPU delegate) | Selfie mask for occlusion at 256×256 |
+| **Face swap** | InsightFace | Photorealistic face transfer for avatar generation |
+| **Garment diffusion** | CatVTON (via `tryon_backend`) | Diffusion-model garment overlay for high-realism previews |
+| **Backend framework** | FastAPI + uvicorn | Python GPU backends over HTTP and WebSocket |
+| **State management** | Provider (`^6.1.2`) | Reactive state across screens |
+| **3D model viewer** | `model_viewer_plus ^1.8.1` | `.glb` garment preview with pan/zoom/AR Quick Look |
+
+## Why Open Source?
+
+Mirror Fit operates on a strict **zero paid APIs** principle: every model weight is either downloaded from Hugging Face or bundled in `assets/ml_models/`, every GPU workload runs on a self-hosted machine, and the codebase is MIT-licensed.
+
+- **Self-hosted GPU backends** — The face-swap, try-on, live-portrait, and AI-twin services each run as an isolated FastAPI process on a single NVIDIA GPU box. `start_all.ps1` starts only the services that are down, leaving active sessions untouched.
+- **On-device ML** — Pose detection (MLKit) and body segmentation (TFLite with GPU delegate) run locally on the phone. All per-frame math is pure Dart — no network calls in the hot path.
+- **MIT license** — Fork it, extend it, ship it. The full pipeline — from `pipeline_types.dart` to the Python diffusion server — is available without restriction.
+
+## Project Components
+
+Mirror Fit is composed of four distinct systems that work together:
+
+1. **Flutter App (`lib/`)** — The mobile front-end. Internally named `lucy_tryon` (app title: `LUCY`), it hosts the real-time AR pipeline (`lib/ar_tryon/`), original try-on screens, and WebView-based Decart realtime streaming. Entry point: `lib/main.dart`.
+
+2. **Face Swap Backend (`face_swap_backend/main.py`)** — A FastAPI server providing static face swap, live WebSocket swap, avatar catalogue management, and a voice-transform endpoint. Powered by InsightFace, runs on the shared conda environment at port 7860.
+
+3. **Live Try-On Backend (`tryon_backend/server.py`)** — A WebSocket diffusion server that takes a user frame and a garment image and returns a composited result using CatVTON inpainting. Runs at port 8000; requires `HF_TOKEN` to pull model weights from Hugging Face.
+
+4. **ML Scoring Modules** — The `fit_score` and `returns_risk` Python modules compute garment-to-body fit quality and pre-purchase return likelihood from body dimensions and garment specifications.
+
+<Note>
+  Camera-dependent features — real-time AR try-on, live face swap, pose detection — require a **physical Android or iOS device**. The iOS simulator and Android emulator do not expose a real camera stream to Flutter's `camera` package. Connect a device via USB or wireless ADB before running `flutter run`.
+</Note>

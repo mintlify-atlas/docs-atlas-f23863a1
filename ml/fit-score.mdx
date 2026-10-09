@@ -1,0 +1,247 @@
+---
+title: "Fit Scoring Engine: Geometry-Based Garment Grading"
+sidebarTitle: "Fit Score"
+description: "How Mirror Fit's fit scoring engine measures garment-to-body ratios against industry ease allowances and returns a 0–100 score with a five-tier fit label."
+---
+
+Fit is geometry, not opinion. Four garment measurements — chest, shoulder, body length, and sleeve length — divided by the wearer's corresponding body measurements yield scale-invariant ratios. These ratios are then compared against industry ease allowances (the apparel trade's own tolerances, not invented constants) to produce a 0–100 score and one of five fit tiers. Because the try-on measures in pixels and pixel scale shifts every time the shopper moves, working in ratios rather than centimetres is what makes the measurement meaningful at all.
+
+---
+
+## Fit Classes
+
+The engine grades every garment into one of five classes, ordered from best to worst — the class index is itself meaningful.
+
+<CardGroup cols={2}>
+  <Card title="MADE_FOR_YOU" icon="star">
+    **Made for your body.** Every measurement sits in the tailored band. This is as close as ready-to-wear gets to made-to-measure.
+  </Card>
+  <Card title="GOOD_FIT" icon="check">
+    **Good fit.** Within normal tolerance across the board. Nothing a shopper would send back on fit alone.
+  </Card>
+  <Card title="OVERSIZED" icon="arrow-up-right-dots">
+    **Oversized.** Consistently larger than this body. Fine if the shopper wants it loose, a return risk if they do not.
+  </Card>
+  <Card title="UNDERSIZED" icon="arrow-down-right-dots">
+    **Undersized.** Consistently tighter than this body needs. The most common cause of a fit return.
+  </Card>
+  <Card title="POOR_FIT" icon="triangle-exclamation">
+    **Poor fit.** The measurements disagree with each other — the right size in one place and wrong in another. No single size will fix this cut.
+  </Card>
+</CardGroup>
+
+These labels and their copy come directly from `CLASS_COPY` in `fit_score/spec.py` and are exported verbatim into `demo/fit_model.json` so the browser and the Python model always stay in sync.
+
+---
+
+## Ease Allowances
+
+Ease is the extra room a garment leaves over the body. The engine uses industry ease allowances keyed by garment type — a jacket is worn over other layers, so its correct ease is larger than a t-shirt's. This is why `IDEAL_EASE` is a dict rather than a single global constant.
+
+### The `EaseProfile` dataclass
+
+```python
+@dataclass(frozen=True)
+class EaseProfile:
+    chest: float
+    shoulder: float
+    length: float
+    sleeve: float
+```
+
+Each field is the garment/body ratio that represents ideal ease for that measurement. A value of `1.14` for chest means the garment should be 14% wider than the body at chest level.
+
+### Ideal ease by garment type
+
+| Garment | Chest | Shoulder | Length | Sleeve |
+|---------|-------|----------|--------|--------|
+| `tshirt` | 1.14 | 1.03 | 1.00 | 1.00 |
+| `shirt` | 1.16 | 1.04 | 1.06 | 1.00 |
+| `jacket` | 1.24 | 1.07 | 1.04 | 1.02 |
+| `dress` | 1.12 | 1.02 | 1.00 | 1.00 |
+| `trousers` | 1.10 | 1.00 | 1.00 | 1.00 |
+
+Two tolerance bands control how far a ratio may drift from the ideal before the class changes:
+
+- **`TAILORED_TOLERANCE = 0.045`** — ±4.5% of ideal → `MADE_FOR_YOU`
+- **`WEARABLE_TOLERANCE = 0.115`** — ±11.5% of ideal → still `GOOD_FIT`
+
+---
+
+## Fit Score Formula
+
+The `fit_score()` function converts the four deviations from ideal into a single 0–100 number using a weighted root-mean-square penalty:
+
+```python
+def fit_score(row: dict) -> float:
+    """0-100. How close this garment is to being cut for this body.
+
+    A weighted RMS of the deviations, mapped so that a perfectly tailored
+    garment scores 100 and one at the edge of wearability scores ~55.
+
+    Chest and shoulder carry the most weight because they are the hardest
+    to alter and the most visible when wrong. Length is adjustable by a
+    tailor, sleeve more so, hence the lower weights.
+    """
+    d = deviations(row)
+    weights = {"chest": 0.38, "shoulder": 0.32, "length": 0.18, "sleeve": 0.12}
+    penalty = sum(w * (d[k] ** 2) for k, w in weights.items()) ** 0.5
+    # 0.115 deviation (edge of wearable) should land near 55.
+    score = 100.0 * (1.0 - (penalty / WEARABLE_TOLERANCE) * 0.45)
+    return float(max(0.0, min(100.0, score)))
+```
+
+### Why these weights?
+
+| Measurement | Weight | Reason |
+|-------------|--------|--------|
+| `chest` | 0.38 | Hardest to alter; most visible when wrong |
+| `shoulder` | 0.32 | Cannot be adjusted after manufacture; determines drape |
+| `length` | 0.18 | Can be hemmed by a tailor |
+| `sleeve` | 0.12 | Most adjustable; least structurally critical |
+
+The deviations themselves are signed fractions of the ideal: positive means the garment is larger than ideal, negative means smaller. They are computed by `deviations(row)`, which looks up the garment's `EaseProfile` and computes `ratio / ideal_ease - 1.0` for each axis.
+
+---
+
+## The Derived Features Problem
+
+Training on the four raw ratios alone reveals a fundamental representational problem: logistic regression scored **0.00 recall on `MADE_FOR_YOU`** — it never once identified a tailored garment. This is not a tuning failure; it is a geometric one.
+
+`MADE_FOR_YOU` means *every* measurement is close to ideal simultaneously. In raw-ratio space that is a **bounded box** around the ideal point. A linear model can only cut space with hyperplanes — it can never enclose a bounded region. The boundary it needs is simply not expressible.
+
+Three derived features fix this by turning those boxes into half-spaces:
+
+```python
+def derive(row: dict) -> dict[str, float]:
+    d = deviations(row)
+    every = [d["chest"], d["shoulder"], d["length"], d["sleeve"]]
+    return {
+        "dev_chest":      d["chest"],
+        "dev_shoulder":   d["shoulder"],
+        "dev_length":     d["length"],
+        "dev_sleeve":     d["sleeve"],
+        # How wrong is the worst measurement?
+        "worst_abs_dev":  max(abs(v) for v in every),
+        # Do the measurements disagree with each other?
+        "dev_spread":     max(every) - min(every),
+        # Which direction, on the two measurements that matter most?
+        "core_dev_mean":  (d["chest"] + d["shoulder"]) / 2.0,
+    }
+```
+
+These are also the three questions a tailor asks — which is the reason they work, not a coincidence.
+
+### Before and after derived features
+
+| Metric | Raw ratios only | + Derived features |
+|--------|-----------------|--------------------|
+| Accuracy | 0.708 | **0.966** |
+| Macro F1 | 0.469 | **0.959** |
+| `MADE_FOR_YOU` recall | **0.000** | **0.913** |
+
+---
+
+## Real-Data Model
+
+The shipped Fit Analyser also trains on real fit outcomes from the **RentTheRunway dataset** (Misra, Wan & McAuley, RecSys 2018): **192,544 real rentals**, each with customer measurements, the size rented, and the outcome (`small` / `fit` / `large`).
+
+```bash
+returns_risk/.venv/bin/python -m fit_score.real_model --export
+```
+
+### Why macro F1, not accuracy
+
+73.8% of this dataset is labelled `fit`. A model that always answers `fit` scores **73.8% accuracy** while never once warning a shopper. Macro F1 is the honest headline.
+
+| | Accuracy | Macro F1 |
+|---|---|---|
+| Always predict "fit" baseline | 0.742 | 0.284 |
+| Shipped real-data model | 0.665 | **0.471** |
+
+The model gives up accuracy on purpose to actually call `small` and `large`.
+
+### Honest held-out performance (real-data model)
+
+| Class | Recall | Precision | Support |
+|-------|--------|-----------|---------|
+| `small` | 0.282 | 0.315 | 5,128 |
+| `fit` | 0.788 | 0.783 | 28,563 |
+| `large` | 0.341 | 0.318 | 4,818 |
+
+Precision on `small`/`large` is ~0.31 — roughly two in three warnings are false alarms. Wrong-direction advice (telling someone to size up when they should size down) is **1.62%**, down from 5.12% before collaborative history features were added.
+
+<Warning>
+The real-data model uses only three classes (`small`, `fit`, `large`). `MADE_FOR_YOU` and `POOR_FIT` cannot be learned from the RentTheRunway data — nobody measured the garments, so there is no ground truth for tailored-versus-merely-acceptable. The five-tier classification exists only in the synthetic model, where the generator defined those bands. Claiming five tiers from this data would be inventing labels.
+</Warning>
+
+---
+
+## Connecting to Returns Risk
+
+The `mismatch_from_score()` function is the join between the two systems — what the mirror measured at purchase is what the returns desk sees later:
+
+```python
+def mismatch_from_score(score: float) -> float:
+    """Convert a 0-100 fit score into the 0-1 `fit_mismatch_score` that the
+    returns model consumes. This is the join between the two systems: what
+    the mirror measured at purchase is what the returns desk sees later."""
+    return float(max(0.0, min(1.0, (100.0 - score) / 100.0)))
+```
+
+A perfect fit score of 100 maps to `fit_mismatch_score = 0.0`; a score of 0 maps to `1.0`. This value is stored at purchase time and becomes an input feature of the returns-risk classifier — a high mismatch makes a "doesn't fit" claim **more** credible (the garment really was cut wrong for that body), while a low mismatch from a shopper who used try-on is a signal the returns model can flag.
+
+---
+
+## Running the Model
+
+<Steps>
+  <Step title="Run the synthetic model report">
+    ```bash
+    returns_risk/.venv/bin/python -m fit_score.model
+    ```
+    Prints accuracy, macro F1, per-class recall/precision on the held-out test split (n=2,800).
+  </Step>
+  <Step title="Export synthetic model to JSON">
+    ```bash
+    returns_risk/.venv/bin/python -m fit_score.model --export
+    ```
+    Writes `demo/fit_model.json` for browser-side inference.
+  </Step>
+  <Step title="Train and export the real-data model">
+    ```bash
+    returns_risk/.venv/bin/python -m fit_score.real_model --export
+    ```
+    Trains on the RentTheRunway dataset and writes `demo/fit_model_real.json`.
+  </Step>
+</Steps>
+
+### Python usage example
+
+```python
+from fit_score.spec import fit_score, mismatch_from_score
+
+# A shopper's garment/body measurement ratios for a jacket
+row = {
+    "garment_type": "jacket",
+    "chest_ratio": 1.28,       # garment chest / body chest
+    "shoulder_ratio": 1.09,    # garment shoulder / body shoulder
+    "length_ratio": 1.06,      # garment body length / wearer torso
+    "sleeve_ratio": 1.04,      # garment sleeve / wearer arm
+    "drape_slack": 0.12,       # unsupported fabric fraction
+    "shoulder_drop_cm": 1.5,   # seam past shoulder point, cm
+}
+
+score = fit_score(row)
+# e.g. → 82.4
+
+mismatch = mismatch_from_score(score)
+# e.g. → 0.176  (stored at purchase; consumed by returns_risk at return time)
+
+print(f"Fit score: {score:.1f}/100")
+print(f"Fit mismatch (for returns model): {mismatch:.3f}")
+```
+
+<Tip>
+The `fit_score()` function only needs the four ratio fields and `garment_type`. `drape_slack` and `shoulder_drop_cm` are used by the downstream classifier as raw features but do not affect the score itself.
+</Tip>

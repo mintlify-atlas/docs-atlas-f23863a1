@@ -1,0 +1,121 @@
+{
+  "projectType": "saas",
+  "projectName": "Mirror Fit",
+  "projectDescription": "A Flutter-based virtual try-on platform with real-time AR garment overlay, AI avatar generation, fit scoring, and returns-risk analysis — all running on open-source tooling with zero paid APIs.",
+  "theme": "willow",
+  "primaryColor": "#A8194E",
+  "lightColor": "#FBEFF3",
+  "darkColor": "#85103C",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Flutter App",
+            "pages": [
+              "flutter/project-structure",
+              "flutter/ar-pipeline",
+              "flutter/garment-fitting",
+              "flutter/3d-rendering",
+              "flutter/performance"
+            ]
+          },
+          {
+            "group": "Backend Services",
+            "pages": [
+              "backends/overview",
+              "backends/face-swap",
+              "backends/live-tryon",
+              "backends/instantid",
+              "backends/deployment"
+            ]
+          },
+          {
+            "group": "AI & ML Models",
+            "pages": [
+              "ml/fit-score",
+              "ml/returns-risk",
+              "ml/training"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/blender-export",
+              "guides/platform-config",
+              "guides/api-keys"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Face Swap Backend",
+            "pages": [
+              "api/face-swap/health",
+              "api/face-swap/swap",
+              "api/face-swap/avatars",
+              "api/face-swap/tryon",
+              "api/face-swap/websockets"
+            ]
+          },
+          {
+            "group": "Live Try-On Backend",
+            "pages": [
+              "api/tryon/health",
+              "api/tryon/websocket"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Real-time AR garment overlay at 30 FPS using MediaPipe pose detection and TFLite body segmentation",
+    "AI avatar generation with face swap, body shape selection, and skin-tone matching",
+    "Photo-realistic identity transfer via InstantID + SDXL Lightning",
+    "Fit scoring engine (0–100) using industry ease allowances with 96.6% accuracy",
+    "Returns-risk classifier with cost-sensitive threshold selection to minimise false positives",
+    "Live virtual try-on via diffusion model with per-frame blending over WebSocket",
+    "Occlusion handling for arms over garments using z-depth from pose landmarks",
+    "Adaptive quality system (High/Medium/Low/Minimal) based on real-time FPS monitoring",
+    "Zero paid APIs — fully open-source stack (MediaPipe, TFLite, InsightFace, CatVTON)"
+  ],
+  "publicApiSurface": [
+    "POST /face-swap",
+    "POST /fashn/run",
+    "GET /avatars",
+    "POST /avatars/create",
+    "POST /avatars/{avatar_id}/body",
+    "POST /avatars/{avatar_id}/tryon",
+    "POST /avatars/{avatar_id}/stylize",
+    "DELETE /avatars/{avatar_id}",
+    "POST /face-swap/with-avatar",
+    "POST /voice/transform",
+    "POST /lipsync/generate",
+    "WS /ws/live-swap",
+    "WS /ws/live-swap-v2",
+    "WS /ws/voice-stream",
+    "GET /health (face-swap backend)",
+    "WS /ws/tryon (live try-on backend)",
+    "GET /health (live try-on backend)",
+    "TryOnPipeline (Dart) — initialize(), start(), stop(), setGarment(), setViewport()",
+    "GarmentFitter (Dart) — computeTransform(BodyDimensions, GarmentConfig)",
+    "BodyDimensionEstimator (Dart) — estimate(PoseResult)",
+    "PerformanceOptimizer (Dart) — updateFPS(), currentQuality",
+    "fit_score.spec.fit_score(row) → float",
+    "fit_score.spec.mismatch_from_score(score) → float",
+    "returns_risk.decision.classify(features) → Action"
+  ]
+}

@@ -1,20 +1,62 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Mirror Fit: Real-Time Virtual Try-On Platform"
+sidebarTitle: "Home"
+description: "Mirror Fit is an open-source Flutter virtual try-on platform with real-time AR garment overlay, AI avatars, fit scoring, and returns-risk analysis — zero paid APIs."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Mirror Fit is a full-stack virtual try-on platform built with Flutter, Python, and open-source AI. Shoppers see garments on their body in real time through the camera, generate AI avatars with their face, and receive a quantified fit score — all on-device or via self-hosted GPU backends, with no paid third-party APIs.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run the Flutter app and backends on your machine in minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand the full pipeline from camera frame to rendered garment.
+  </Card>
+  <Card title="AR Pipeline" icon="camera" href="/flutter/ar-pipeline">
+    Pose detection, body segmentation, and real-time garment overlay.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/face-swap/health">
+    REST and WebSocket endpoints for the face-swap and try-on backends.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## What Mirror Fit Does
+
+Mirror Fit combines four independent systems into one seamless experience:
+
+<CardGroup cols={2}>
+  <Card title="Real-Time AR Try-On" icon="shirt">
+    MediaPipe pose detection + TFLite body segmentation overlay garments at 30 FPS directly in the camera feed — no cloud round-trip needed.
+  </Card>
+  <Card title="AI Avatar Generation" icon="user-astronaut">
+    Upload a selfie, pick a body shape, and get a full-body avatar via InsightFace face swap with LAB colour-space skin-tone matching.
+  </Card>
+  <Card title="Fit Scoring" icon="ruler">
+    A logistic regression model trained on industry ease allowances grades chest, shoulder, length, and sleeve ratios, returning a 0–100 fit score and a five-tier label.
+  </Card>
+  <Card title="Returns-Risk Analysis" icon="shield-check">
+    A cost-sensitive binary classifier flags suspicious return requests for human review — never auto-denying a refund — keeping false positives below 0.05%.
+  </Card>
+</CardGroup>
+
+## Get Started
+
+<Steps>
+  <Step title="Install Flutter and Python dependencies">
+    Run `flutter pub get` in the project root and `pip install -r requirements.txt` in each backend directory.
+  </Step>
+  <Step title="Add ML model assets">
+    Place `selfie_segmentation.tflite` in `assets/ml_models/` and your Blender-exported `.glb` garment files in `assets/models/`.
+  </Step>
+  <Step title="Start the backends">
+    Launch the face-swap and try-on backends with `start_all.ps1` (Windows) or individually via `uvicorn` on Linux/macOS.
+  </Step>
+  <Step title="Run on device">
+    Connect an Android or iOS device and run `flutter run`. Tap **Live Try-On** on the home screen to start.
+  </Step>
+</Steps>
+
+<Note>
+Mirror Fit requires a physical device — camera-dependent features do not work on simulators or emulators.
+</Note>

@@ -1,0 +1,164 @@
+---
+title: "InstantID Backend: Photo-Realistic Identity Transfer"
+sidebarTitle: "InstantID"
+description: "The Mirror Fit InstantID backend generates photo-realistic face renders with the avatar's identity and the user's live expression using SDXL Lightning 4-step."
+---
+
+The InstantID backend (`instantid_backend/server.py`) runs on port **7861** and implements photo-realistic face identity transfer using SDXL Lightning 4-step + InstantID ControlNet + ArcFace identity embeddings. Per WebSocket session, the backend takes one avatar image and computes the avatar's 512-dimensional ArcFace identity embedding **once** at session init. For every subsequent webcam frame from the client, it generates a new face image that carries the avatar's identity but the user's live expression, head pose, eye direction, and lighting. Output is 1024×1024, approximately 95% photo-realistic, at ~1.5–2.0 seconds per frame on a g5.xlarge (A10G). At ~0.6 fps this is suitable for a "photo-real mirror" UX, not for fluid real-time motion.
+
+Avatars are read from `face_swap_backend/avatars_cache/<id>.jpg` so both backends share the same avatar set without duplication.
+
+## One-Time Setup
+
+<Steps>
+  <Step title="Run setup.ps1">
+    ```powershell
+    cd C:\virtual-try-on\instantid_backend
+    powershell .\setup.ps1
+    ```
+    This script:
+    1. Creates conda env `instantid` with Python 3.11.
+    2. Installs PyTorch (CUDA 12.1), diffusers, transformers, and insightface.
+    3. Downloads all model weights into `models/` (see [Models Downloaded](#models-downloaded)).
+
+    Total download: **~12 GB**, estimated **~20 minutes** on AWS Mumbai region (ap-south-1).
+  </Step>
+  <Step title="Verify weights">
+    After setup, confirm the critical files exist:
+    ```powershell
+    Test-Path C:\virtual-try-on\instantid_backend\models\antelopev2\glintr100.onnx
+    # Should return True
+    ```
+  </Step>
+</Steps>
+
+## Running
+
+```powershell
+cd C:\virtual-try-on\instantid_backend
+powershell .\start.ps1
+```
+
+The server logs cold-load progress to stdout. The first model load takes **30–60 seconds**. The backend is ready for traffic when `[InstantID] engine ready for traffic` appears in the log. Two dummy warmup frames are run automatically at init so the first real user request does not hit the 8–12 second kernel autotune delay.
+
+## Protocol
+
+The WebSocket endpoint is `/ws/instantid-swap`. The protocol is **identical** to `/ws/live-swap` on the face-swap backend, so the Flutter demo client can switch between them without any changes.
+
+| Direction | Message type | Payload |
+|---|---|---|
+| Client → Server | `init` | `{"avatar_id": "gen_f_01", "session_id": "..."}` |
+| Client → Server | `frame` | `{"image": "<base64 JPEG>"}` |
+| Client → Server | `ping` | `{"t": <timestamp>}` — keepalive |
+| Server → Client | `ready` | `{"session_id": "..."}` |
+| Server → Client | `result` | `{"image": "<base64 JPEG>"}` |
+| Server → Client | `no_face` | Frame rejected — no face detected |
+| Server → Client | `dropped` | Server still processing the previous frame |
+| Server → Client | `error` | `{"message": "..."}` |
+
+### Latency Budget
+
+| Stage | ms |
+|---|---|
+| Network India ↔ Mumbai RTT | 80 |
+| Frame decode (base64 → JPEG → ndarray) | 5 |
+| InsightFace detection (640 px) | 30 |
+| Diffusion 4-step (1024 px) | 1500 |
+| VAE decode + crop + resize | 100 |
+| JPEG encode + base64 | 30 |
+| **Total per frame** | **~1,745 ms (~0.6 fps)** |
+
+## Python Environment
+
+<Warning>
+  The InstantID backend **requires Python 3.11** in a dedicated conda env named `instantid`. It cannot share the base conda env (`C:\miniconda3\python.exe`) with the face-swap and try-on backends. The reason: PyTorch CUDA wheels do not exist for Python 3.14 (which the face-swap backend uses). Running `setup.ps1` creates the isolated `instantid` env with exactly Python 3.11 and the CUDA 12.1 PyTorch wheel.
+
+  If you see `No CUDA capable device` on `import torch`, you ran the install in the wrong env. `conda activate instantid` first.
+</Warning>
+
+Key pinned packages from `instantid_backend/requirements.txt`:
+
+```
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+diffusers==0.31.0
+transformers==4.46.0
+insightface==0.7.3
+onnxruntime-gpu==1.19.2
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+```
+
+## Models Downloaded
+
+`setup.ps1` downloads the following weights into `instantid_backend/models/`:
+
+| Model | Purpose | Size |
+|---|---|---|
+| SDXL base (`stabilityai/stable-diffusion-xl-base-1.0`) | Base UNet for generation | ~6.9 GB |
+| SDXL Lightning 4-step UNet (`ByteDance/SDXL-Lightning`) | Replaces SDXL UNet for 4-step fast inference | ~1.7 GB |
+| InstantID ControlNet weights (`InstantX/InstantID`) | Face identity conditioning via IP-Adapter + ControlNet | ~1.7 GB |
+| antelopev2 InsightFace bundle | ArcFace 512-d embedding extraction (`glintr100.onnx` + RetinaFace) | ~0.5 GB |
+
+**Total: ~12 GB**
+
+If the `antelopev2` download was rate-limited by GitHub, re-run `setup.ps1`. The missing file path is `models/antelopev2/glintr100.onnx`.
+
+## REST Endpoints
+
+In addition to the WebSocket interface, the InstantID server exposes:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Returns `{"status": "ok", "engine_loaded": <bool>}` |
+| `POST` | `/stylize` | Accepts a photo upload + `style` form field; returns a cartoon portrait of that person using InstantID + a style prompt. Used by `POST /avatars/{id}/stylize` on the face-swap backend. |
+
+<Note>
+  The face-swap backend calls the InstantID server's `/stylize` endpoint whenever a user requests `POST /avatars/{id}/stylize`. The URL is configured via the `LUCY_INSTANTID_URL` environment variable on the face-swap backend, defaulting to `http://127.0.0.1:7861`. If the InstantID server is not running, the face-swap backend returns HTTP 503 with: `"Could not reach the InstantID backend at http://127.0.0.1:7861. Start it with instantid_backend/start.ps1."`
+</Note>
+
+## Co-existence with Other Backends
+
+Both the face-swap backend (port 7860) and the InstantID backend (port 7861) can run concurrently on the same machine. The demo client tries InstantID first; if it cannot connect within 3 seconds, it falls back to the inswapper-128 backend on port 7860.
+
+On a shared A10G (24 GB), the InstantID pipeline needs approximately 14 GB of VRAM. If the face-swap backend is also loaded in full, VRAM is tight. Set `LUCY_MINIMAL_MODE=1` on the face-swap backend to skip all GPU model loads and free ~3–4 GB, giving the InstantID pipeline the full 24 GB.
+
+| Instance type | VRAM | Fit |
+|---|---|---|
+| AWS g5.xlarge (A10G) | 24 GB | Both backends fit; use `LUCY_MINIMAL_MODE=1` if face-swap is not needed |
+| AWS g4dn.xlarge (T4) | 16 GB | InstantID only fits at 768 px output; full 1024 px OOMs |
+
+## Troubleshooting
+
+<Tabs>
+  <Tab title="No CUDA">
+    ```
+    No CUDA capable device
+    ```
+    You ran `setup.ps1` or `start.ps1` in the base conda env instead of the `instantid` env. Run:
+    ```powershell
+    conda activate instantid
+    python -c "import torch; print(torch.cuda.is_available())"
+    ```
+  </Tab>
+  <Tab title="antelopev2 not found">
+    ```
+    antelopev2 not found
+    ```
+    Re-run `setup.ps1`. The GitHub download may have been rate-limited. Check for:
+    ```
+    C:\virtual-try-on\instantid_backend\models\antelopev2\glintr100.onnx
+    ```
+  </Tab>
+  <Tab title="First frame takes 12 s">
+    This is CUDA kernel autotune on first inference — expected behaviour. Subsequent frames will take the documented 1.5–2.0 s. The server runs two warmup frames automatically at startup to pre-trigger autotune before the first user request.
+  </Tab>
+  <Tab title="OOM on first frame">
+    The pipeline needs ~14 GB VRAM. Check current usage:
+    ```powershell
+    nvidia-smi
+    ```
+    If the face-swap backend is running in full mode, set `LUCY_MINIMAL_MODE=1` and restart it to free GPU memory.
+  </Tab>
+</Tabs>

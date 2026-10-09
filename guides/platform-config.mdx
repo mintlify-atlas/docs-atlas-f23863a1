@@ -1,0 +1,154 @@
+---
+title: "Android and iOS Platform Configuration for Mirror Fit"
+sidebarTitle: "Platform Config"
+description: "Required permissions, minimum SDK versions, and native configuration for running Mirror Fit on Android and iOS devices."
+---
+
+Mirror Fit relies on three device capabilities that require explicit platform configuration: the **device camera** (live AR feed), **TFLite with the GPU delegate** (body segmentation at 3–5× CPU speed), and **MediaPipe pose detection** via `google_mlkit_pose_detection` (33-landmark skeleton tracking). Each capability requires permissions and minimum OS/SDK versions that differ between Android and iOS. The sections below cover every required change and flag the current iOS 26 compatibility issue that affects the ML packages.
+
+<Tabs>
+  <Tab title="Android">
+
+    ### Camera Permission
+
+    Add the camera permission to `android/app/src/main/AndroidManifest.xml` inside the `<manifest>` element, before the `<application>` tag:
+
+    ```xml
+    <uses-permission android:name="android.permission.CAMERA" />
+    ```
+
+    Mirror Fit requests the permission at runtime via the `camera` package — the manifest entry is still required even with runtime prompting.
+
+    ### Minimum SDK Version
+
+    The hard minimum for Google MLKit is **API 21**. For TFLite with the OpenGL ES 3.1 GPU delegate, which provides the 3–5× segmentation speedup, the effective minimum is **API 24**.
+
+    The current `android/app/build.gradle.kts` delegates the SDK version to Flutter's default:
+
+    ```kotlin
+    defaultConfig {
+        applicationId = "com.raymond.raymond_tryon"
+        minSdk = flutter.minSdkVersion
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+    ```
+
+    To pin the minimum SDK explicitly and unlock the TFLite GPU delegate, replace `flutter.minSdkVersion` with a hard-coded value:
+
+    ```kotlin
+    defaultConfig {
+        applicationId = "com.raymond.raymond_tryon"
+        minSdk = 24          // API 24+ for TFLite GPU delegate (OpenGL ES 3.1)
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+    }
+    ```
+
+    ### NDK Version
+
+    The project currently inherits the NDK version from Flutter's plugin:
+
+    ```kotlin
+    ndkVersion = flutter.ndkVersion
+    ```
+
+    This is safe for the current dependency set. If you integrate native libraries that require a specific NDK (e.g. a custom TFLite delegate), pin it explicitly using `ndkVersion = "26.1.10909125"` or whichever version the library's documentation specifies.
+
+    ### Java / Kotlin Compatibility
+
+    The project targets **Java 17** on both sides:
+
+    ```kotlin
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17.toString()
+    }
+    ```
+
+    This is required by several of Mirror Fit's dependencies, including newer versions of the Google MLKit libraries.
+
+  </Tab>
+  <Tab title="iOS">
+
+    ### Camera Usage Description
+
+    Add the following key to `ios/Runner/Info.plist` inside the root `<dict>`:
+
+    ```xml
+    <key>NSCameraUsageDescription</key>
+    <string>Mirror Fit needs camera access for real-time virtual try-on.</string>
+    ```
+
+    iOS will refuse to open the camera and throw a `CameraException` if this key is absent, even after the user grants permission.
+
+    ### Minimum iOS Version
+
+    Set the deployment target to **iOS 12.0** (hard minimum for Google MLKit) in `ios/Podfile`:
+
+    ```ruby
+    platform :ios, '12.0'
+    ```
+
+    The TFLite Metal GPU delegate — which is the iOS equivalent of the Android OpenGL ES 3.1 delegate — is supported from iOS 12 onwards and is enabled automatically by `tflite_flutter` when a Metal-capable device is detected.
+
+    ### iOS 26 Compatibility Issue
+
+    <Warning>
+      `google_mlkit_pose_detection` and `tflite_flutter` are **currently disabled** in `pubspec.yaml` because both packages crash on iOS 26. The Flutter AR pipeline (pose detection, body segmentation, garment fitting) is therefore **stubbed out on iOS** until compatible versions of these packages are released or the crashes are resolved upstream.
+
+      Do not uncomment these lines without first verifying on a physical iOS 26 device:
+
+      ```yaml
+      # google_mlkit_pose_detection: ^0.14.1    # disabled — crashes on iOS 26
+      # tflite_flutter: ^0.12.1                 # disabled — crashes on iOS 26
+      ```
+
+      The `model_viewer_plus` 3D viewer and the Decart AI realtime WebRTC screen (`flutter_inappwebview`) are unaffected and work on iOS today.
+    </Warning>
+
+  </Tab>
+</Tabs>
+
+## pubspec.yaml Platform Packages
+
+The full AR-related dependency block in `pubspec.yaml`, showing which packages are active and which are temporarily disabled:
+
+```yaml
+# ── Decart Realtime WebRTC ──────────────────────────────────
+flutter_inappwebview: ^6.1.5               # WebRTC camera streaming via WebView
+
+# ── AR Try-On Pipeline ──────────────────────────────────────
+camera: ^0.12.0+1                          # Real-time camera stream (ACTIVE)
+model_viewer_plus: ^1.8.1                  # 3D .glb model viewer (ACTIVE)
+# google_mlkit_pose_detection: ^0.14.1     # disabled — crashes on iOS 26
+# tflite_flutter: ^0.12.1                  # disabled — crashes on iOS 26
+# flutter_unity_widget: ^2022.2.1          # Unity 3D renderer (uncomment when Unity project ready)
+# ar_flutter_plugin: ^0.7.3               # ARCore/ARKit (optional AR layer)
+```
+
+The `camera` and `model_viewer_plus` packages are active on both platforms. The two commented-out ML packages will re-enable the full on-device pipeline (pose detection + body segmentation + garment fitting) once the iOS 26 crash is resolved. `flutter_unity_widget` and `ar_flutter_plugin` are separate optional enhancements not yet needed.
+
+## App Icon Configuration
+
+The launcher icons are generated by the `flutter_launcher_icons` dev dependency. The current configuration in `pubspec.yaml` produces an adaptive icon on Android (API 26+) with the Mirror Fit purple as the background colour:
+
+```yaml
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icons/app_icon.png"
+  adaptive_icon_background: "#6C63FF"
+  adaptive_icon_foreground: "assets/icons/app_icon.png"
+```
+
+Regenerate icons after changing `app_icon.png` or the background colour:
+
+```bash
+dart run flutter_launcher_icons
+```

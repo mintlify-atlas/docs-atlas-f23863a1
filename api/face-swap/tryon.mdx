@@ -1,0 +1,153 @@
+---
+title: "POST /avatars/{avatar_id}/tryon — Garment Try-On"
+sidebarTitle: "POST /tryon"
+description: "POST /avatars/{avatar_id}/tryon runs CatVTON garment try-on on a specific avatar, returning a composited image with the garment applied."
+---
+
+The try-on endpoint runs the full VTON pipeline against a named avatar: human parse → DensePose → cloth-agnostic mask → CatVTON (or IDM-VTON) inference → hard paste-back. The hard paste-back is the critical step — every pixel outside the garment mask is copied verbatim from the input avatar image rather than regenerated, which means the avatar's face and identity are arithmetically preserved, not merely "probably" preserved. The pipeline asserts this before returning.
+
+The same page also covers two related media-generation endpoints: `POST /lipsync/generate` for producing an audio-driven lip-sync video, and `POST /voice/transform` for a single-shot audio pitch-shift.
+
+---
+
+## POST /avatars/{avatar_id}/tryon
+
+Applies a garment image to an avatar. Requires a full-body avatar (assign one first via `POST /avatars/{id}/body`). The try-on pipeline is loaded lazily on the first call; expect 30–60 seconds of additional latency on that first request while models are loaded into GPU memory.
+
+<ParamField path="avatar_id" type="string" required>
+  The avatar ID from `GET /avatars`. Works with both preset and enrolled
+  avatars, provided the avatar's image exists in `avatars_cache/`.
+</ParamField>
+
+<ParamField body="garment_image" type="file" required>
+  The garment photograph. A clean product shot on a plain background
+  produces the best results. Accepted formats: JPEG, PNG — any image
+  OpenCV can decode.
+</ParamField>
+
+<ParamField body="category" type="string" required>
+  The garment category. Controls which body-part labels the VTON model is
+  allowed to replace. Must be one of:
+
+  - `"upper"` — tops, shirts, jackets, blouses. Replaces the upper-body
+    and arm regions.
+  - `"lower"` — trousers, skirts. Replaces the lower-body region.
+  - `"dress"` — full-length dresses. Replaces upper-body, skirt, and arms.
+</ParamField>
+
+**Response:** `200 OK` — `image/jpeg` bytes of the composited avatar wearing the garment.
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | Empty garment file upload. |
+| `404` | Avatar not found or avatar image file missing. |
+| `422` | `category` is not one of `upper`, `lower`, `dress`. |
+| `422` | Try-on pipeline raised a validation error (e.g. no body detected). |
+| `503` | Try-on pipeline backends are not loaded (parser, DensePose, or VTON model unavailable). |
+| `500` | Internal try-on failure. |
+
+<Note>
+  The try-on pipeline is loaded lazily. The first request after server
+  startup — or after a server restart — loads the parser, DensePose, and
+  VTON model weights and may take **30–60 seconds** before returning.
+  Subsequent requests use the cached pipeline and are much faster.
+</Note>
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/avatars/usr_3a7f91bc/tryon \
+  -F "garment_image=@shirt.jpg" \
+  -F "category=upper" \
+  --output tryon_result.jpg
+```
+
+---
+
+## POST /lipsync/generate
+
+Generates an MP4 video of an avatar lip-syncing to uploaded audio. The endpoint first pitch-shifts the audio to the avatar's voice profile (same as `POST /voice/transform`), then passes the shifted audio and the avatar's face image to Wav2Lip to generate mouth-motion frames, and finally encodes the frames plus audio into an MP4 via FFmpeg.
+
+<ParamField body="audio" type="file" required>
+  The input audio file. WAV is preferred. WebM/OGG are also accepted if
+  FFmpeg is available on the server. The audio is pitch-shifted before
+  being passed to Wav2Lip.
+</ParamField>
+
+<ParamField body="avatar_id" type="string" required>
+  The ID of the avatar whose face will be lip-synced. The avatar's image
+  at `avatars_cache/{id}.jpg` is used as the reference face.
+</ParamField>
+
+**Response:** `200 OK` — `video/mp4` bytes at 25 fps.
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | Empty audio upload. |
+| `404` | `avatar_id` not found in the catalogue. |
+| `503` | Wav2Lip model is not loaded. Download `wav2lip_gan.onnx` into `models/models/`. |
+| `500` | Pitch-shift, inference, or FFmpeg encoding failed. |
+
+<Note>
+  Check `optional.wav2lip` in the `/health` response before calling this
+  endpoint. It returns `503` immediately if the Wav2Lip ONNX model is not
+  loaded.
+</Note>
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/lipsync/generate \
+  -F "audio=@speech.wav" \
+  -F "avatar_id=gen_f_01" \
+  --output lipsync.mp4
+```
+
+---
+
+## POST /voice/transform
+
+Accepts a browser audio recording and returns the same audio pitch-shifted to the avatar's voice profile. Female avatars (`gen_f_*`) are shifted +4 semitones; male avatars (`gen_m_*`) are shifted −4 semitones. User-enrolled avatars (`usr_*`) receive 0 semitones (natural voice). The result is a 16-bit PCM WAV file.
+
+<ParamField body="audio" type="file" required>
+  The input audio. WAV is preferred; `soundfile` handles it natively. WebM
+  and OGG are decoded via librosa/audioread if FFmpeg is available.
+</ParamField>
+
+<ParamField body="avatar_id" type="string" required>
+  The target avatar ID. Controls which pitch-shift and optional effect
+  profile is applied.
+</ParamField>
+
+**Response:** `200 OK` — `audio/wav` bytes (PCM 16-bit, same sample rate as input).
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | Empty audio upload. |
+| `404` | `avatar_id` not found. |
+| `500` | Pitch shift or WAV encoding failed. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/voice/transform \
+  -F "audio=@recording.wav" \
+  -F "avatar_id=gen_f_01" \
+  --output transformed.wav
+```
+
+---
+
+<Warning>
+  The face-swap backend, try-on pipeline, and InstantID backend (port 7861)
+  all share a single GPU. Sending concurrent requests — for example, a
+  `/tryon` call while a live-swap WebSocket session is active — may exhaust
+  GPU memory and cause an out-of-memory error. Sequence heavy operations
+  rather than parallelizing them on the same GPU node.
+</Warning>

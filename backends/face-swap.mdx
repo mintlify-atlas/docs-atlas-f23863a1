@@ -1,0 +1,153 @@
+---
+title: "Face Swap Backend: Avatars, Swaps, and Try-On"
+sidebarTitle: "Face Swap"
+description: "The Mirror Fit face-swap FastAPI server: static face swap, live WebSocket swap, avatar management, voice transform, lipsync, and garment try-on."
+---
+
+The face-swap backend (`face_swap_backend/main.py`) is the primary Mirror Fit service, running on port **7860**. It is built with FastAPI and InsightFace, and exposes endpoints for static face swapping, two generations of live WebSocket face swap (V1 and V2), a full avatar management system, voice pitch transform, Wav2Lip audio-driven lipsync, and a server-side proxy to FASHN.ai for garment try-on. On startup it loads InsightFace `buffalo_l`, `inswapper_128.onnx`, an optional CodeFormer ONNX for face restoration, an optional BiSeNet face parser for hair transfer, and an optional Wav2Lip ONNX for audio-driven lipsync.
+
+## Avatar System
+
+### Preset Catalogue
+
+The backend ships a hard-coded catalogue of AI-generated portraits spanning five demographic groups and four age ranges:
+
+| Category | IDs | Names |
+|---|---|---|
+| Women | `gen_f_01` – `gen_f_05` | Aria, Anaya, Zara, Mei, Sofia |
+| Men | `gen_m_01` – `gen_m_05` | Lucas, Kai, Malik, Ren, Diego |
+| Kids (boys) | `gen_b_01` – `gen_b_04` | Leo, Arjun, Hiro, Jamal |
+| Kids (girls) | `gen_g_01` – `gen_g_04` | Emma, Priya, Mei-Lin, Amara |
+| Indian — Kids | `gen_ib_01`, `gen_ig_01` | Aarav, Diya |
+| Indian — Teens | `gen_ib_02`, `gen_ig_02` | Vihaan, Ananya |
+| Indian — Adults | `gen_im_01` – `gen_im_03`, `gen_if_01` – `gen_if_03` | Rohan, Rajesh, Dadaji, Isha, Meera, Dadiji |
+| AI / Cartoon | `ai_b_01` – `ai_b_04`, `ai_g_01` – `ai_g_04` | Toby, Riku, Kabir, Marcus, Lily, Sakura, Tara, Nia |
+
+Each preset record carries an `id`, `name`, `category`, `ethnicity`, `gender`, and `voice_ref`. Preset images live in `avatars_cache/{id}.jpg` and are generated offline by `generate_avatars.py`. They cannot be deleted via the API.
+
+### User-Enrolled Avatars
+
+Users can enrol a selfie as a custom avatar via `POST /avatars/create`. Enrolled avatars receive a `usr_*` prefixed ID and are recorded in `avatars_cache/user_avatars.json`. They support three additional operations that presets do not: body assignment, cartoon stylisation, and deletion.
+
+Every consumer — static swap, live swap V1/V2, Wav2Lip lipsync, hair transfer, try-on — resolves an avatar by the same path: **`avatars_cache/{id}.jpg`**. Giving an enrolled avatar a body does not add a second file; the full-body composite is written back over that same path.
+
+<Note>
+  Base bodies are **curated photographs**, not images generated at runtime. A previous design generated body images with a text-to-image model at build time. Because the validation gate only checked whether a face was detectable — a question a two-torso image answers "yes" — 18 broken figures shipped in two rounds. The current design uses a fixed, human-reviewed asset set in `assets/base_bodies/`, admitted one at a time via `tools/curate_base_bodies.py` after a human has inspected each image.
+</Note>
+
+## Face Swap Pipeline
+
+### Static Swap
+
+`POST /face-swap` accepts two uploaded images (source, target) and returns a JPEG. The dispatcher in `_swap()` detects whether the source is a cartoon (by edge density heuristic in `_is_cartoon()`) and routes to the appropriate path:
+
+- **Real faces** (`_swap_real`): inswapper_128 pass → Poisson seamless clone of the head+hair oval back onto the original target.
+- **Cartoon/anime** (`_swap_geometric`): colour transfer, scale-matched paste, then seamless clone with `MIXED_CLONE`.
+
+### Live WebSocket Swap (V1)
+
+`/ws/live-swap` is the per-frame live path. The client sends `{type: "init", avatar_id, session_id}` to begin a session, then streams `{type: "frame", image: <base64 JPEG>}` messages. The server uses a cached source face detection and a stripped-down `_face_app_fast` (detection + landmarks only, no recognition or gender/age) for per-frame target detection to reduce latency.
+
+The full live swap pipeline per frame:
+1. `_run_inswapper` — inswapper_128 with identity boost (`LUCY_IDENTITY_BOOST`, default 1.3)
+2. `_color_correct_face_hull` — Reinhard LAB colour transfer, face hull sampled from 106 landmarks
+3. BiSeNet hair transfer (`face_parser.transfer_hair`) if `LUCY_HAIR_SWAP=1`
+4. Mouth mask overlay (`_apply_mouth_mask`) if `LUCY_MOUTH_MASK=1` — composites the user's real lip pixels back over the swap for real-time lip motion
+5. Optional CodeFormer face restoration every Nth frame (`LUCY_CODEFORMER_EVERY`, default 1)
+
+### Live WebSocket Swap (V2)
+
+`/ws/live-swap-v2` uses the Deep-Live-Cam architecture (`swap_v2.py`): `inswapper_128_fp16.onnx` (265 MB) + `GFPGANv1.4.onnx` (325 MB). Both weights are auto-downloaded from HuggingFace on first boot unless `LUCY_AUTO_DOWNLOAD=0` is set. The `/health` endpoint reports whether these weights are present and correctly sized.
+
+### Hair Transfer
+
+Optional BiSeNet hair transfer warps the avatar's hair onto the user's head. Requires `face_parser.onnx` in `models/models/`. Controlled by `LUCY_HAIR_SWAP=1` (default on). The `LUCY_HAIR_GROW` knob (default 9 px) dilates the warped hair mask to close thin partings, and `LUCY_HAIR_EARS=1` (default on) paints ear-region strips to prevent the user's own ears from showing through avatar hair that parts around them.
+
+## Body Assignment
+
+Body shape selection is a pure-function lookup in `body_shapes.py` — no I/O, no model, no image creation. It maps a gender and optional measurements to one of eight curated photographs.
+
+**Four builds per gender:**
+
+| Build | Condition |
+|---|---|
+| `slim` | Chest/bust below lower cutoff (male < 94 cm, female < 86 cm) |
+| `average` | Between the two cutoffs |
+| `athletic` | Ordinary girth with pronounced chest-to-waist drop (male ≥ 1.22, female ≥ 1.28) |
+| `plus` | Chest above upper cutoff (male ≥ 108 cm, female ≥ 100 cm) **or** large waist (male ≥ 100 cm, female ≥ 94 cm) |
+
+Key rules from `body_shapes.py`:
+- `plus` is decided **before** `athletic` — a garment that does not go round the chest is not saved by having the right taper drop.
+- Chest without waist is ignored, not half-used — one measurement alone gives no ratio.
+- No measurements at all → the gender's `average` bin.
+- Cutoffs follow common Indian ready-to-wear chest/bust bands.
+
+If the selected bin has no approved photograph in the manifest, `POST /avatars/{id}/body` returns **HTTP 501** naming the missing ID. It does **not** fall back to a neighbouring build.
+
+## Avatar Validation
+
+Every avatar write goes through the anatomy gate in `avatar_validation.py`. The validator is loaded lazily via `_get_validator()` and **raises `ValidatorUnavailable`** if the pose model is missing — it never silently passes everything. This prevents the class of bug where broken base bodies (two-torso images) were admitted because the gate only checked for a detectable face.
+
+Validation checks, each reported separately in the response:
+
+| Check | Catches |
+|---|---|
+| `single_person` | 0 or 2+ people — the two-torso signature |
+| `complete_skeleton` | Missing or low-confidence keypoints — cropped figures |
+| `vertical_order` | Nose above shoulders above hips above knees above ankles |
+| `proportions` | Limb ratios outside human range (Drillis & Contini tables) |
+| `single_blob` | A second figure the pose model missed |
+
+## Starting the Server
+
+<Steps>
+  <Step title="Set environment variables">
+    ```powershell
+    $env:FASHN_API_KEY       = "fsh_..."
+    $env:LUCY_INSTANTID_URL  = "http://127.0.0.1:7861"
+    # Optional tuning knobs (defaults shown):
+    $env:LUCY_IDENTITY_BOOST = "1.3"
+    $env:LUCY_HULL_EXPAND    = "1.22"
+    $env:LUCY_CLONE_MODE     = "normal"   # normal | mixed | alpha
+    $env:LUCY_HAIR_SWAP      = "1"
+    $env:LUCY_MOUTH_MASK     = "1"
+    $env:LUCY_CODEFORMER_EVERY = "1"
+    ```
+  </Step>
+  <Step title="Start with uvicorn">
+    ```powershell
+    cd C:\virtual-try-on\face_swap_backend
+    & C:\miniconda3\python.exe -m uvicorn main:app --host 0.0.0.0 --port 7860
+    ```
+    Or use `start_all.ps1` to manage all backends together (see [Deployment](/backends/deployment)).
+  </Step>
+  <Step title="Verify">
+    ```bash
+    curl http://localhost:7860/health
+    ```
+  </Step>
+</Steps>
+
+## Endpoint Reference
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Model load status, engine availability, weight sizes |
+| `GET` | `/avatars` | List all avatars (presets + enrolled) |
+| `GET` | `/avatars/{id}/image` | Serve avatar JPEG from `avatars_cache/` |
+| `POST` | `/avatars/create` | Enrol a selfie; validates face before writing |
+| `POST` | `/avatars/{id}/body` | Assign a curated base body via measurements |
+| `POST` | `/avatars/{id}/stylize` | Generate cartoon version via InstantID backend |
+| `GET` | `/avatars/{id}/style-image` | Serve the cartoon version |
+| `DELETE` | `/avatars/{id}` | Remove an enrolled avatar (presets forbidden) |
+| `GET` | `/base-bodies` | Per-bin readiness of the curated asset set |
+| `POST` | `/face-swap` | Static face swap (source + target upload → JPEG) |
+| `POST` | `/face-swap/with-avatar` | Static swap using a catalogue avatar as source |
+| `POST` | `/avatars/{id}/tryon` | Garment try-on on the avatar (CatVTON pipeline) |
+| `POST` | `/fashn/run` | Proxy a request to FASHN.ai (API key server-side) |
+| `POST` | `/voice/transform` | Pitch-shift audio to match an avatar's voice profile |
+| `WS` | `/ws/live-swap` | Live face swap V1 (inswapper_128) |
+| `WS` | `/ws/live-swap-v2` | Live face swap V2 (inswapper_128_fp16 + GFPGAN) |
+| `WS` | `/ws/voice-stream` | Real-time audio pitch transform stream |
+| `WS` | `/ws/lipsync` | Wav2Lip audio-driven lip sync stream |
+| `GET` | `/demo/*` | Serves the static demo UI from `demo/` |

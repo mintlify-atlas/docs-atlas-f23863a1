@@ -1,0 +1,246 @@
+---
+title: "Mirror Fit System Architecture and Data Flow"
+sidebarTitle: "Architecture"
+description: "How Mirror Fit's camera pipeline, AR overlay, AI backends, fit scoring, and returns-risk analysis connect into a single end-to-end system."
+---
+
+Mirror Fit is structured in three cooperating layers: an **on-device Flutter pipeline** that runs entirely within the phone at 30–40 FPS, a set of **self-hosted GPU backends** that handle photorealistic AI inference over HTTP and WebSocket, and a pair of **ML scoring modules** that translate body measurements into fit quality and return-risk predictions. The layers are intentionally decoupled — the on-device pipeline works offline and never blocks on a network call; the backends are additive, enabling richer features when available.
+
+## On-Device Pipeline
+
+The core AR experience lives in `lib/ar_tryon/`. Each camera frame passes through a fixed sequence of processing stages, all coordinated by `TryOnPipeline` (`lib/ar_tryon/core/tryon_pipeline.dart`). The shared data types that flow between stages are defined in `lib/ar_tryon/core/pipeline_types.dart`.
+
+### Per-Frame Data Flow
+
+```
+CameraFrame → PoseResult → BodyDimensions → GarmentTransform
+    ↓              ↓                              ↓
+SegmentationMask  Landmarks                  ScaledModel
+    ↓              ↓                              ↓
+OcclusionMask → CompositeRenderer → Final Output Frame
+```
+
+Each stage maps to a dedicated module in `lib/ar_tryon/`:
+
+| Stage | Module | Output type |
+|---|---|---|
+| Camera capture | `camera/camera_service.dart` | `CameraImage` (YUV420 / BGRA8888) |
+| Pose detection | `pose/pose_detector_service.dart` | `PoseResult` (33 `Landmark` objects) |
+| Body segmentation | `segmentation/body_segmenter.dart` | `SegmentationMask` (256×256, `Uint8List`) |
+| Dimension estimation | `body/body_dimension_estimator.dart` | `BodyDimensions` |
+| Garment fitting | `fitting/garment_fitter.dart` | `GarmentTransform` |
+| Occlusion handling | `occlusion/occlusion_handler.dart` | `RenderLayer[]` |
+| Compositing | `rendering/garment_renderer.dart` | Display frame |
+
+### Pipeline Types
+
+The key data structures from `lib/ar_tryon/core/pipeline_types.dart` are:
+
+**`Landmark`** — a single 3D point from MediaPipe's 33-landmark skeleton, carrying `x`, `y`, `z`, `confidence`, and a `LandmarkType` enum value. Provides both `distanceTo` (3D Euclidean) and `distanceTo2D` helpers.
+
+**`PoseResult`** — the full set of landmarks for one frame, with `O(1)` lookup via an internal `Map<LandmarkType, Landmark>`. Exposes computed properties such as `shoulderCenter`, `hipCenter`, `isValid` (both shoulders visible), and `hasFullBody` (all four major joints visible).
+
+**`BodyDimensions`** — measurements derived from the pose: `shoulderWidthPx`, `torsoHeightPx`, `leftArmLengthPx`, `rightArmLengthPx`, `hipWidthPx`, `bodyAngleDegrees`, and `torsoCenter`. Smoothed over a 5-frame window.
+
+**`GarmentTransform`** — the result of the fitting algorithm: `x`, `y`, `scaleX`, `scaleY`, `rotationDegrees`, `opacity`, and `shoulderLineInImage` (fraction from top — used by the mesh deformer to align the shoulder seam).
+
+**`SegmentationMask`** — a `Uint8List` buffer at 256×256 with `isForeground(x, y)` and `valueAt(x, y)` accessors. `maskAgeFrames` on `PipelineFrame` tracks how stale the mask is; the renderer skips mask-based erasure when it exceeds 2 to prevent frozen-mask artifacts over a moving arm.
+
+### Per-Frame Timing Targets
+
+| Stage | Target time | Implementation |
+|---|---|---|
+| Camera capture | ~0 ms | `camera` package |
+| Pose detection | ~15 ms | MediaPipe via MLKit |
+| Body segmentation | ~10 ms | TFLite + GPU delegate |
+| Dimension estimation | ~1 ms | Pure Dart math |
+| Garment fitting | ~1 ms | Pure Dart math |
+| Compositing | ~2 ms | Flutter `CustomPainter` |
+| **Total** | **~25–30 ms** | **= 30–40 FPS** |
+
+All processing is on-device. No cloud calls exist in the hot path.
+
+### Garment Fitting Formula
+
+The `garment_fitter.dart` module maps pose measurements to a `GarmentTransform` using the following formulas:
+
+```
+For tops:
+  Width  = shoulder_distance × shoulder_padding (default 1.2)
+  Height = torso_height × (1 + hem_extension)
+  Anchor = shoulder midpoint (offset up 5% for neckline)
+
+For bottoms:
+  Width  = hip_width × 1.1
+  Height = torso_height × 1.2
+  Anchor = hip midpoint
+
+For full body:
+  Width  = shoulder_distance × shoulder_padding
+  Height = torso_height × 2.2  (shoulder to knee)
+  Anchor = shoulder midpoint
+
+Rotation    = body_angle clamped to ±25°
+Perspective = scaleX × cos(body_angle) when |angle| > 5°
+Smoothing   = lerp(previous, current, 0.7) per frame
+```
+
+### Occlusion Rendering Order
+
+The occlusion handler uses z-depth from pose landmarks to determine when arms should render in front of the garment overlay:
+
+```
+Render order (painter's algorithm):
+  Camera feed       (background, depth 2.0)
+    → Garment overlay   (middle,     depth 1.0)
+      → Occluding arms  (foreground, depth 0.5)
+
+Trigger condition:
+  arm.z < torso.z − 0.05  →  arm is in front of clothing
+  Arm region built from shoulder→elbow→wrist path (radius: 35 px)
+  Cross-referenced with segmentation mask (body pixels only)
+```
+
+### Adaptive Quality Levels
+
+`lib/ar_tryon/core/performance_optimizer.dart` degrades gracefully on lower-end devices:
+
+| FPS range | Quality level | Active features |
+|---|---|---|
+| ≥ 30 FPS | High | Segmentation + Occlusion + Accurate pose |
+| 20–30 FPS | Medium | Segmentation + Base pose model |
+| 15–20 FPS | Low | Pose only, 360p input |
+| < 15 FPS | Minimal | Pose only, 240p input |
+
+## GPU Backends
+
+Three Python services handle the AI-intensive workloads that exceed on-device capability. They are managed by `start_all.ps1` and communicate with the Flutter app over HTTP REST and WebSocket.
+
+<CardGroup cols={3}>
+  <Card title="Face Swap Backend" icon="face-smile">
+    **Port 7860** · `face_swap_backend/main.py`
+
+    FastAPI server providing static face swap, live WebSocket face swap, avatar catalogue management, and a voice-transform endpoint. Built on **InsightFace** (`FaceAnalysis`) with optional hair-transfer via `face_parser`. Maintains an avatar cache at `face_swap_backend/avatars_cache/`. Runs on the shared conda env (`C:\miniconda3\python.exe`).
+  </Card>
+  <Card title="Live Try-On Backend" icon="shirt">
+    **Port 8000** · `tryon_backend/server.py`
+
+    WebSocket diffusion server that composites a garment onto a user frame using **CatVTON** inpainting. Requires `HF_TOKEN` to pull model weights from Hugging Face. Uses a `ThreadPoolExecutor` for non-blocking inference and an `alpha_new = 0.7` blend weight between successive frames. DWPose conditioning is currently disabled (mediapipe legacy API breakage — tracked in PROGRESS.md).
+  </Card>
+  <Card title="Supporting Backends" icon="server">
+    **Port 7862** · `liveportrait_backend/server.py`
+
+    Animates a still avatar photograph using LivePortrait, running in its own isolated conda env (`envs\liveportrait`).
+
+    **Port 7863** · `sadtalker_backend/server.py`
+
+    Drives a talking-head AI twin from audio input using SadTalker, isolated in `envs\sadtalker`.
+  </Card>
+</CardGroup>
+
+### Backend Communication Pattern
+
+The Flutter app communicates with the backends through two channels:
+
+```
+Flutter App
+  │
+  ├── HTTP POST  ──→  face_swap_backend :7860  /swap, /avatars, /voice
+  │
+  ├── WebSocket  ──→  face_swap_backend :7860  /ws/live-swap
+  │
+  ├── WebSocket  ──→  tryon_backend     :8000  /ws/tryon
+  │
+  └── WebView    ──→  demo/index.html   :7860  (Decart realtime WebRTC)
+```
+
+The `flutter_inappwebview ^6.1.5` package handles the WebRTC-based Decart realtime screen, which captures and sends one frame every 3 seconds to the diffusion backend and blends the result with a CSS crossfade transition.
+
+## ML Scoring Layer
+
+Two Python modules operate above the raw inference layer to produce user-facing quality signals:
+
+**`fit_score`** — Ingests `BodyDimensions` (shoulder width, torso height, hip width, arm lengths) and garment size specifications, and computes a `fit_mismatch_score`. The score quantifies how well the detected body dimensions align with the garment's intended measurements, surfacing a numerical confidence for each dimension axis.
+
+**`returns_risk`** — Consumes the `fit_mismatch_score` from `fit_score` alongside garment metadata (category, size label, material stretch factor) to estimate the probability that the item will be returned. The output gates the size recommendation displayed on the product detail screen and can surface an alternative size if the primary fit score is below threshold.
+
+The two modules are connected through `fit_mismatch_score` as a shared contract: `fit_score` writes it, `returns_risk` reads it.
+
+```
+BodyDimensions (from on-device pipeline)
+    │
+    ▼
+fit_score module
+    │ fit_mismatch_score
+    ▼
+returns_risk module
+    │ return_probability, recommended_size
+    ▼
+Product Detail Screen (Flutter)
+```
+
+<Note>
+  The AR Avatar, Fit Analyser, and Returns Guard tabs in the demo UI run entirely in the browser and require no backend process. Only the face-swap, live try-on, live portrait, and AI twin features depend on the GPU backends being reachable.
+</Note>
+
+## Technology Stack
+
+<CardGroup cols={3}>
+  <Card title="Flutter On-Device Layer" icon="mobile">
+    **Framework:** Flutter `sdk: ^3.10.1` (Dart)
+
+    **Pose:** `google_mlkit_pose_detection` (MediaPipe, 33 landmarks)
+
+    **Segmentation:** `tflite_flutter` (TFLite GPU delegate, 256×256)
+
+    **3D viewer:** `model_viewer_plus ^1.8.1` (`.glb` / `.gltf`)
+
+    **State:** `provider ^6.1.2`
+
+    **WebRTC:** `flutter_inappwebview ^6.1.5`
+  </Card>
+  <Card title="Python GPU Backends" icon="brain">
+    **Framework:** FastAPI + uvicorn
+
+    **Face AI:** InsightFace (`FaceAnalysis`)
+
+    **Garment AI:** CatVTON (diffusion inpainting)
+
+    **Portrait AI:** LivePortrait
+
+    **Talking head:** SadTalker
+
+    **Runtime:** Python 3.11, conda environments, NVIDIA GPU (CUDA)
+  </Card>
+  <Card title="Tooling & Infrastructure" icon="wrench">
+    **Models:** MediaPipe Selfie Segmentation, DeepLabV3 (TFLite)
+
+    **Model hub:** Hugging Face (weights fetched via `HF_TOKEN`)
+
+    **Asset pipeline:** Blender → glTF 2.0 + Draco compression
+
+    **Orchestration:** `start_all.ps1` (PowerShell, Windows GPU box)
+
+    **Logging:** `C:\logs\<service>.log` per backend
+
+    **License:** MIT
+  </Card>
+</CardGroup>
+
+### Full Stack Reference Table
+
+| Component | Technology | Purpose |
+|---|---|---|
+| Mobile app | Flutter / Dart | Cross-platform UI, camera, AR rendering |
+| Camera service | `camera ^0.12.0+1` | 30 FPS stream, YUV420 / BGRA8888 |
+| Pose detection | MLKit / MediaPipe | 33 skeletal landmarks per frame |
+| Body segmentation | TFLite + GPU delegate | Per-pixel body mask, ~10 ms/frame |
+| Garment fitting | Pure Dart | Anchor, scale, rotate, perspective |
+| Occlusion | `CustomPainter` + z-depth | Arm-over-garment depth ordering |
+| 3D model viewer | `model_viewer_plus` | AR Quick Look / Scene Viewer for `.glb` |
+| Face swap | InsightFace | Avatar generation and live face swap |
+| Garment diffusion | CatVTON | High-realism garment compositing |
+| Fit scoring | `fit_score` (Python) | Dimension-to-spec mismatch score |
+| Returns risk | `returns_risk` (Python) | Pre-purchase return probability |
+| Backend API | FastAPI + uvicorn | HTTP + WebSocket endpoints |
+| Backend infra | Windows + NVIDIA GPU | Self-hosted, zero cloud spend |

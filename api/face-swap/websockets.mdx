@@ -1,0 +1,311 @@
+---
+title: "WebSocket Endpoints: Live Swap and Voice Stream"
+sidebarTitle: "WebSockets"
+description: "Real-time WebSocket endpoints for live face swapping (/ws/live-swap-v2), legacy V1 swap, and live voice transformation (/ws/voice-stream)."
+---
+
+Three WebSocket endpoints provide real-time bidirectional streaming. `/ws/live-swap-v2` (recommended) and `/ws/live-swap` (legacy V1) both stream camera frames and receive composited face-swapped frames back at low latency. `/ws/voice-stream` streams Float32 PCM audio chunks and receives pitch-shifted audio back in real time. All three are accessed via `ws://localhost:8000/ws/…`. A server-side keepalive ping is sent every 20 seconds on all connections to prevent NAT/proxy idle timeouts.
+
+---
+
+## Live Swap V2 (`/ws/live-swap-v2`)
+
+The recommended endpoint. Uses the Deep-Live-Cam architecture: `inswapper_128_fp16.onnx` for the face swap and `GFPGANv1.4.onnx` for face restoration, with an optional BiSeNet hair-swap pass and a mouth-mask overlay that preserves real-time lip motion verbatim.
+
+The server sends `{"type":"error","message":"V2 swap not available …"}` and closes the connection immediately if the required weight files are missing. Check `engines.v2` in `/health` before connecting.
+
+### Protocol
+
+All messages are JSON text unless otherwise noted.
+
+#### Client → Server: init
+
+Send once at the start of the session to supply the source face.
+
+```json
+{
+  "type": "init",
+  "avatar_id": "gen_f_01",
+  "hair": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Must be `"init"`. |
+| `avatar_id` | string | ID from `GET /avatars`. The server loads `avatars_cache/{id}.jpg` as the source face. |
+| `source_image` | string | Alternative to `avatar_id`. Base64-encoded JPEG of a custom source face. |
+| `hair` | boolean | Request BiSeNet hair transfer. Defaults to the server's `LUCY_HAIR_SWAP` setting. |
+
+#### Server → Client: ready
+
+Sent after a successful init. Confirms the source embedding has been extracted and the session is ready for frames.
+
+```json
+{
+  "type": "ready",
+  "hair": true,
+  "hair_reason": null
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hair` | boolean | Whether hair transfer is actually active for this session. |
+| `hair_reason` | string \| null | Why hair was disabled if `hair` is `false` (e.g. `"no hair found in the source image"`). |
+
+#### Client → Server: frame
+
+Send once per camera frame. The server processes one frame at a time; if a `frame` arrives while the previous one is still processing it is dropped and a `dropped` response is sent.
+
+```json
+{
+  "type": "frame",
+  "id": "frame-42",
+  "image": "<base64-encoded JPEG>"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Must be `"frame"`. |
+| `id` | string | Optional client-assigned frame identifier echoed back in the response. |
+| `image` | string | Base64-encoded JPEG of the camera frame. |
+
+#### Server → Client: result
+
+```json
+{
+  "type": "result",
+  "id": "frame-42",
+  "image": "<base64-encoded JPEG>",
+  "mask": "<base64-encoded JPEG>"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `image` | string | Base64-encoded JPEG of the composited frame (quality 85). |
+| `mask` | string | Present only when hair is active. Base64-encoded grayscale JPEG of the changed-pixel mask. The client should composite `image` onto the live camera feed using this mask rather than cutting a fixed face oval, because hair extends above the oval. |
+
+#### Other server messages
+
+| `type` | Meaning |
+|--------|---------|
+| `no_face` | No face detected in the submitted frame. |
+| `dropped` | Frame was dropped because the previous frame was still processing. |
+| `error` | A message-level error. Field `message` contains the reason. |
+| `ping` | Server keepalive. The client may reply with `{"type":"pong"}` or ignore it. |
+
+### JavaScript Example
+
+```javascript
+const ws = new WebSocket('ws://localhost:8000/ws/live-swap-v2');
+ws.binaryType = 'arraybuffer';
+
+ws.onopen = () => {
+  // Step 1: send init with the chosen avatar
+  ws.send(JSON.stringify({
+    type: 'init',
+    avatar_id: 'gen_f_01',
+    hair: true,
+  }));
+};
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+
+  if (msg.type === 'ready') {
+    console.log('Session ready, hair:', msg.hair);
+    startSendingFrames();
+    return;
+  }
+
+  if (msg.type === 'result') {
+    // Decode and display the swapped frame
+    const img = new Image();
+    img.src = 'data:image/jpeg;base64,' + msg.image;
+    document.getElementById('output').replaceChildren(img);
+    return;
+  }
+
+  if (msg.type === 'ping') {
+    ws.send(JSON.stringify({ type: 'pong' }));
+    return;
+  }
+};
+
+let frameTimer = null;
+
+function startSendingFrames() {
+  const video = document.getElementById('camera'); // HTMLVideoElement
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext('2d');
+
+  frameTimer = setInterval(() => {
+    ctx.drawImage(video, 0, 0);
+    // Convert the camera frame to a base64 JPEG and send it
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    const b64 = dataUrl.split(',')[1];
+    ws.send(JSON.stringify({
+      type: 'frame',
+      id: `frame-${Date.now()}`,
+      image: b64,
+    }));
+  }, 3000); // one frame every 3 seconds — see Warning below
+}
+
+ws.onclose = () => {
+  clearInterval(frameTimer);
+  console.log('WebSocket closed');
+};
+```
+
+---
+
+## Live Swap V1 (`/ws/live-swap`)
+
+The legacy endpoint retained for A/B comparison. Uses the V1 pipeline: `inswapper_128.onnx` + CodeFormer + optional BiSeNet hair swap + optional Wav2Lip mouth sync. It shares session state with `/ws/voice-stream` via a `session_id` so Wav2Lip can drive the avatar's mouth from the pitch-shifted audio buffer.
+
+The message protocol is identical to V2 with two additions:
+
+**Extra init fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Optional shared key linking this swap session to a concurrent `/ws/voice-stream` session. When both connections send the same `session_id`, the live-swap loop reads the rolling pitch-shifted audio buffer from the voice stream to drive Wav2Lip lip-sync. Falls back to `avatar_id` when omitted. |
+
+**Extra result fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `audio_t_ms` | integer | Cumulative pitch-shifted audio output time in milliseconds. Provided so the client can align audio playback with the video stream. |
+
+The server replies `{"type":"ready","session_id":"…","hair":true}` after init.
+
+<Note>
+  V1 is intentionally feature-complete but not actively optimized. For new
+  integrations use V2 (`/ws/live-swap-v2`).
+</Note>
+
+---
+
+## Voice Stream (`/ws/voice-stream`)
+
+Real-time voice transformation. The client streams raw Float32 PCM audio and receives pitch-shifted PCM back in the same chunk size. When `session_id` matches a concurrent `/ws/live-swap` session, the shifted audio is appended to a shared rolling buffer so Wav2Lip can drive the avatar's mouth.
+
+### Audio format
+
+| Parameter | Value |
+|-----------|-------|
+| Encoding | Float32 little-endian |
+| Sample rate | 16 000 Hz |
+| Channels | Mono |
+| Chunk size | ~256 ms (≈ 4 096 samples at 16 kHz) |
+
+### Protocol
+
+#### Client → Server: init (text)
+
+```json
+{
+  "type": "init",
+  "avatar_id": "gen_f_01",
+  "session_id": "my-session-123"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `avatar_id` | string | Determines the pitch-shift profile. `gen_f_*` → +4 semitones, `gen_m_*` → −4 semitones, `usr_*` → 0 semitones. |
+| `session_id` | string | Optional. Links this voice stream to a live-swap WebSocket for Wav2Lip integration. |
+
+#### Server → Client: ready (text)
+
+```json
+{
+  "type": "ready",
+  "semitones": 4,
+  "sample_rate": 16000,
+  "session_id": "my-session-123"
+}
+```
+
+#### Client → Server: audio chunks (binary)
+
+After receiving `ready`, send raw Float32 PCM as binary WebSocket frames. No framing headers — the bytes are passed directly to `numpy.frombuffer(..., dtype=np.float32)`.
+
+#### Server → Client: audio chunks (binary)
+
+The server echoes each chunk back as pitch-shifted Float32 PCM binary frames. Chunks maintain the same duration as the input; buffer them contiguously for smooth playback.
+
+#### Keepalive
+
+The server sends `{"type":"ping","t":<unix_ms>}` every 20 seconds. Reply with `{"type":"pong"}` or ignore.
+
+### JavaScript Example
+
+```javascript
+const ws = new WebSocket('ws://localhost:8000/ws/voice-stream');
+ws.binaryType = 'arraybuffer';
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({
+    type: 'init',
+    avatar_id: 'gen_f_01',
+    session_id: 'my-session-123',
+  }));
+};
+
+ws.onmessage = async (event) => {
+  if (typeof event.data === 'string') {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'ready') {
+      console.log('Voice stream ready, semitones:', msg.semitones);
+      startAudioCapture();
+    }
+    return;
+  }
+  // Binary: Float32 PCM @ 16 kHz — schedule for playback
+  const pcm = new Float32Array(event.data);
+  schedulePlayback(pcm, 16000);
+};
+
+function startAudioCapture() {
+  navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+    const audioCtx = new AudioContext({ sampleRate: 16000 });
+    const source = audioCtx.createMediaStreamSource(stream);
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+    processor.onaudioprocess = (e) => {
+      const samples = e.inputBuffer.getChannelData(0);
+      ws.send(samples.buffer);
+    };
+  });
+}
+```
+
+---
+
+## Connection Lifecycle
+
+1. **Connect** — open the WebSocket at `ws://localhost:8000/ws/live-swap-v2`.
+2. **Init** — send `{"type":"init","avatar_id":"gen_f_01"}`. Wait for `{"type":"ready"}`.
+3. **Stream frames** — send `{"type":"frame","image":"<base64>"}` one at a time. Wait for each `result` before sending the next.
+4. **Disconnect** — close the WebSocket. The server cleans up session state automatically.
+
+For the voice stream, steps 3–4 use binary PCM frames instead of JSON.
+
+<Warning>
+  The Flutter client sends one frame every **3 seconds** deliberately. Sending
+  frames faster than the GPU can process them — for example, every 33 ms (30
+  fps) — causes GPU queue buildup: frames accumulate in memory faster than they
+  are consumed, latency grows unbounded, and the process eventually runs out of
+  GPU memory. The server will drop frames when it is already processing one
+  (`{"type":"dropped"}`), but the client must still pace its sends. One frame
+  every 3 seconds is the tested safe rate on an A10G GPU with all optional
+  models (CodeFormer, hair, Wav2Lip) enabled.
+</Warning>

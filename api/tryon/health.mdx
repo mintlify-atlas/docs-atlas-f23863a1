@@ -1,0 +1,107 @@
+---
+title: "GET /health — Live Try-On Backend Health Check"
+sidebarTitle: "GET /health"
+description: "GET /health on the live try-on backend returns the server status and loaded model information before accepting WebSocket connections."
+---
+
+The health endpoint is the liveness check for the `tryon_backend` server. Poll it before opening a `/ws/tryon` WebSocket to confirm the diffusion model has finished loading — first startup can take 30–60 seconds as CatVTON weights are read from disk and moved onto the GPU. The endpoint is available at port `8000` (shared with face-swap on the A10G GPU box, or on its own port if deployed separately).
+
+## Request
+
+```bash
+GET /health
+```
+
+No path parameters, query parameters, or request body are required.
+
+### Example
+
+```bash
+curl http://SERVER_HOST:8000/health
+```
+
+Replace `SERVER_HOST` with your server's IP or hostname, for example `13.126.77.241`.
+
+## Response
+
+The endpoint returns a JSON object with two fields. HTTP status is always `200` when the server process is alive (even when the model has not yet finished loading).
+
+```json
+{
+  "status": "ok",
+  "model_loaded": true
+}
+```
+
+<ResponseField name="status" type="string" required>
+  Always `"ok"` while the FastAPI process is running. Any non-`200` HTTP
+  response or a connection error means the server process itself is down.
+</ResponseField>
+
+<ResponseField name="model_loaded" type="boolean" required>
+  `true` once `TryOnModel.load()` has completed successfully and the model is
+  ready to serve `/ws/tryon` requests. `false` while the model is still
+  loading at startup, or if model load failed (in which case the process will
+  typically exit shortly after).
+</ResponseField>
+
+## Startup Time
+
+The `TryOnModel` loads CatVTON diffusion weights on every cold start. Because three separate backends (face-swap, live try-on, and AI-twin) share a single 24 GB A10G GPU, available VRAM at load time varies. The server logs free and total VRAM twice — once before loading weights and once after — using the internal `_log_gpu()` helper:
+
+```python
+def _log_gpu(stage: str) -> None:
+    """Record VRAM around model load.
+
+    Three backends share one 24 GB A10G. When face-swap and Live Portrait are
+    already resident, an allocation failure here reads as an unexplained exit,
+    so the headroom at load time is worth having on the record.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            log.warning(f"[gpu/{stage}] CUDA not available — will load on CPU")
+            return
+        free, total = torch.cuda.mem_get_info()
+        log.info(
+            f"[gpu/{stage}] {torch.cuda.get_device_name(0)} "
+            f"free={free/2**30:.1f}GiB of {total/2**30:.1f}GiB "
+            f"(torch {torch.__version__}, cuda {torch.version.cuda})"
+        )
+    except Exception as e:
+        log.warning(f"[gpu/{stage}] could not read GPU state: {e}")
+```
+
+Log lines look like:
+
+```
+2026-09-03 12:01:00,123 [INFO] [gpu/before-load] NVIDIA A10G free=18.4GiB of 24.0GiB (torch 2.1.0, cuda 12.1)
+2026-09-03 12:01:38,456 [INFO] [gpu/after-load] NVIDIA A10G free=10.2GiB of 24.0GiB (torch 2.1.0, cuda 12.1)
+2026-09-03 12:01:38,457 [INFO] Model ready.
+```
+
+If `model_loaded` stays `false` for more than 90 seconds, check the server log for `Model load FAILED` — this usually indicates a VRAM allocation error or a missing/gated Hugging Face model weight. The server process exits after logging the failure.
+
+<Note>
+  `HF_TOKEN` must be set as a permanent machine environment variable before
+  starting the server. Gated model weights (e.g., certain CatVTON checkpoints)
+  return HTTP 401 and silently fall back to a lower-quality tier, which
+  produces a rendering degradation that looks like a bug rather than a
+  credential issue. Set it with:
+  ```powershell
+  [Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_...", "Machine")
+  ```
+</Note>
+
+<Tip>
+  Poll `GET /health` in a loop until `model_loaded` is `true` before opening
+  the `/ws/tryon` WebSocket. A 2-second polling interval with a 90-second
+  timeout is a reasonable client-side heuristic:
+
+  ```bash
+  until curl -sf http://SERVER_HOST:8000/health | grep -q '"model_loaded":true'; do
+    echo "Waiting for model…"; sleep 2
+  done
+  echo "Model ready — opening WebSocket"
+  ```
+</Tip>

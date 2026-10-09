@@ -1,0 +1,148 @@
+---
+title: "Live Try-On Backend: Diffusion-Based Garment Generation"
+sidebarTitle: "Live Try-On"
+description: "The Mirror Fit live try-on backend streams garment generations over WebSocket using CatVTON diffusion with per-frame blending and history smoothing."
+---
+
+The `tryon_backend` runs a diffusion-based virtual try-on pipeline over WebSocket on port **8000**. The Flutter app (via `decart_realtime_screen.dart`) sends a camera frame every 3 seconds; the backend runs CatVTON or an SD 1.5 inpainting fallback, then blends the result with the previous frame before returning a composited garment image. The blend weight is tunable and was the subject of active quality work — see [Frame Blending](#frame-blending) below.
+
+## Architecture
+
+### TryOnModel and Inference Tiers
+
+The core class is `TryOnModel` in `tryon_backend/model.py`. It implements a four-tier inference stack, descending from fastest to slowest depending on which weights are available:
+
+| Tier | Method | Speed | Notes |
+|---|---|---|---|
+| 1 — TRT | TensorRT engine + CUDA graph | ~30–40 fps | Requires `TRT_ENGINE_PATH` env var; activated after training |
+| 2 — Compile | `torch.compile` CatVTON | ~15–20 fps | Requires `VTON_LORA_CHECKPOINT` env var |
+| 3 — Live | SD 1.5 img2img + LCM 2-step + TAESD + IP-Adapter | ~3–5 fps | **Current default** — no training required |
+| 4 — AnimateDiff | AnimateDiff video backbone + DWPose ControlNet | temporal-consistent | Requires `ANIMATEDIFF_ADAPTER_PATH`; DWPose currently disabled |
+
+In practice on a freshly provisioned g5.xlarge, Tier 3 is active. The live WebSocket output is 512×768 px JPEG.
+
+### Thread Pool
+
+The server uses a `ThreadPoolExecutor` with `max_workers=2` (`thread_name_prefix="vton-worker"`): one thread for GPU inference, one for JPEG encode/decode overlap.
+
+### Garment Masking (Identity Guarantee)
+
+The agnostic mask is built from SCHP/ATR human parse labels. The **replaceable** regions per category are:
+
+| Category | Replaced labels |
+|---|---|
+| `upper` | `upper_clothes`, `dress`, `left_arm`, `right_arm` |
+| `lower` | `pants`, `skirt` |
+| `dress` | `upper_clothes`, `dress`, `skirt`, `left_arm`, `right_arm` |
+
+**Protected labels** (never replaced for any category): `face`, `hair`, `hat`, `sunglasses`, `left_shoe`, `right_shoe`, `bag`.
+
+The paste-back after VTON generation is a **hard binary copy** — not a blend — so pixels outside the garment mask are bit-identical to the input. `tryon()` re-asserts `identity_preserved()` on its own output before returning, so a future change to `composite()` fails loudly. The DensePose maps and human parse results are cached per avatar ID; ten garment try-ons on the same avatar run the parser only once.
+
+### EXIF Orientation
+
+`_decode_image()` uses `PIL.ImageOps.exif_transpose()` before any processing. Pillow does not apply the EXIF Orientation tag on open; a garment photo taken in portrait on a phone arrives as a sideways landscape buffer otherwise. WebSocket frames from the Flutter canvas carry no EXIF, so this is a no-op on the live path.
+
+### Parallel Load Guard
+
+The server sets `HF_ENABLE_PARALLEL_LOADING=0` and `HF_PARALLEL_LOADING_WORKERS=0` before importing `transformers`. `transformers 5.x` materialises weights across a thread pool that races inside PyTorch storage indexing on Windows and takes the whole interpreter out with a native access violation. The pinned `requirements.txt` asks for `transformers==4.46.0` (which has no `core_model_loading.py`) as the real fix; the env vars are a guard for when the environment drifts.
+
+## Frame Blending
+
+The backend maintains a per-session previous frame and blends new generations into it before returning. The blend weight is controlled by `alpha_new` in `model.py` (lines 2003–2019):
+
+- **`alpha_new = 0.45`** (previous default): smoother transitions but visible ghosting / double-edges on movement.
+- **`alpha_new = 0.7`** (current): less ghosting, but a more noticeable "pop" every ~3 seconds when the new generation arrives.
+
+The 3-second pop is a direct consequence of the Flutter app's 3-second capture interval — each cycle is a fresh diffusion generation blended into the previous result. Three independent levers exist but have not all been acted on:
+
+1. **Increase the client-side CSS crossfade duration** (currently 0.6 s in `decart_realtime_screen.dart`) — spreads the same per-step change over more perceived time. Lowest risk, no backend changes needed.
+2. **Shorten the 3 s capture interval** — smaller delta per step, at the cost of more GPU load per session.
+3. **Re-tune `alpha_new`** — highest risk; re-opens an already-resolved tradeoff.
+
+## Known Issues
+
+<Warning>
+  DWPose pose-conditioning is **currently disabled**. The log line is: `DWPose failed to load, running without pose conditioning: module 'mediapipe' has no attribute 'solutions'`. This is the same `mediapipe` legacy API breakage (`mediapipe.solutions` removed in favour of `mediapipe.tasks`) that was already fixed in `face_swap_backend/pose_backends.py` (commit `1dfca03`), but has not yet been applied to `tryon_backend`. Without DWPose, the pipeline falls back to vanilla SD 1.5 img2img with no pose conditioning at all (`model.py:1767–1797`), which contributes to garment placement not adapting well to body movement or rotation.
+
+  The fix path is complicated by the fact that the face-swap and try-on backends share one conda env — a `mediapipe` version change would affect the already-fixed face-swap backend — and the DWPose loader is third-party (`controlnet_aux`'s `DWposeDetector`), not custom code. A vendored/patched loader or a newer `controlnet_aux` release is needed. Status: parked pending a decision on the shared-env risk.
+</Warning>
+
+The following quality issues are tracked in [PROGRESS.md](https://github.com/indwar7/Mirror_Fit/blob/main/PROGRESS.md):
+
+| Issue | Detail | Status |
+|---|---|---|
+| Periodic "pop" every ~3 s | Each Flutter capture cycle is a fresh diffusion generation. `alpha_new` was tuned to 0.7 (less ghosting, more pop). Three fix levers exist — see [Frame Blending](#frame-blending). | Open |
+| DWPose disabled | `mediapipe.solutions` legacy API removed; garment placement does not adapt to body rotation. | Open — shared-env risk |
+| Fabric overlay too high on neck | Fixed 80 px fade-in ramp at `model.py:1912–1926`. When the camera is close (large face fraction), 80 px is proportionally too small a gap. Proposed fix: make the gap proportional to detected face height. | Open — fix not yet applied |
+
+## Starting the Server
+
+<Steps>
+  <Step title="Set HF_TOKEN">
+    The tryon backend downloads CatVTON / SD inpainting weights from Hugging Face on first boot. Without a valid token it falls back to a tier that does not apply the garment mask properly, which looks like a rendering bug rather than a missing credential.
+
+    ```powershell
+    # Set permanently (survives reboots):
+    [Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_...", "Machine")
+    ```
+  </Step>
+  <Step title="Start with uvicorn">
+    ```powershell
+    cd C:\virtual-try-on\tryon_backend
+    & C:\miniconda3\python.exe -m uvicorn server:app --host 0.0.0.0 --port 8000
+    ```
+    Or use `start_all.ps1` to manage all backends together (see [Deployment](/backends/deployment)).
+  </Step>
+  <Step title="Optional inference-tier overrides">
+    ```powershell
+    # Force geometric warp (deterministic, no diffusion — useful for debugging):
+    $env:TRYON_FORCE_GEOMETRIC = "1"
+
+    # Override inference step count:
+    $env:VTON_STEPS = "4"
+
+    # Activate LoRA fine-tune checkpoint (Tier 2):
+    $env:VTON_LORA_CHECKPOINT = "C:\models\vton_lora.safetensors"
+    ```
+  </Step>
+</Steps>
+
+## VRAM Usage
+
+Three backends share the A10G's 24 GB. The tryon backend calls `_log_gpu()` at model load time to record available headroom:
+
+```python
+def _log_gpu(stage: str) -> None:
+    free, total = torch.cuda.mem_get_info()
+    log.info(
+        f"[gpu/{stage}] {torch.cuda.get_device_name(0)} "
+        f"free={free/2**30:.1f}GiB of {total/2**30:.1f}GiB "
+        f"(torch {torch.__version__}, cuda {torch.version.cuda})"
+    )
+```
+
+Check the log for the free/total figures at startup:
+
+```powershell
+Get-Content C:\logs\try-on.log -Tail 30 | Select-String "gpu/"
+```
+
+The server also uses `faulthandler.enable()` on startup: a native CUDA/xformers crash that would otherwise produce a silent exit (no traceback, just a shell prompt) will instead print the Python stack naming the frame it died in.
+
+## Requirements
+
+Key pinned packages from `tryon_backend/requirements.txt`:
+
+```
+diffusers[torch]==0.31.0
+transformers==4.46.0
+accelerate==1.1.0
+torch>=2.3.0
+controlnet_aux>=0.0.7
+mediapipe>=0.10.0
+```
+
+<Tip>
+  `diffusers` is pinned to `0.31.0` and `transformers` to `4.46.0`. Unpinning pulled `diffusers 0.37` / `transformers 5.6` / `huggingface_hub 1.14` on a fresh install, which broke CatVTON and SD-Inpainting pipeline loading (silent fallback to plain img2img — no garment mask applied, no error raised).
+</Tip>

@@ -1,0 +1,93 @@
+---
+title: "Export Garment Models from Blender for Mirror Fit"
+sidebarTitle: "Blender Export"
+description: "Prepare and export 3D garment meshes from Blender as optimised .glb files for Mirror Fit's real-time AR try-on pipeline."
+---
+
+Mirror Fit loads `.glb` (glTF Binary) garment models at runtime and overlays them on the live camera feed. Because the app targets mid-range Android devices running at 30 FPS, every model must be optimised for mobile: **under 50,000 polygons** and ideally **under 2 MB** on disk. The sections below walk through model preparation, the exact Blender export settings, and where to place the finished files inside the project.
+
+## Model Preparation
+
+Before exporting, clean up the mesh so the mobile renderer never wastes time on geometry it cannot see.
+
+<Steps>
+  <Step title="Target fewer than 50,000 polygons per garment">
+    Apply Blender's **Decimate** modifier (`Properties → Modifiers → Add → Generate → Decimate`) and reduce the ratio until the poly count is within budget. Check `Mesh Display → Statistics` in the viewport overlay for a live count.
+  </Step>
+  <Step title="Remove interior faces">
+    Select and delete any geometry that is hidden inside the mesh. Interior faces are never visible on mobile and add unnecessary draw calls.
+  </Step>
+  <Step title="Merge vertices by distance">
+    In Edit Mode, press `M → By Distance` and set the threshold to **0.001 m**. This welds floating vertices caused by boolean operations or imported meshes, preventing rendering artefacts and reducing polygon count further.
+  </Step>
+  <Step title="Apply all modifiers before export">
+    With the mesh selected, open the Modifiers panel and apply every modifier in order from top to bottom. The glTF exporter can apply modifiers automatically, but doing this manually first gives you a chance to inspect the result and catch unexpected topology.
+  </Step>
+</Steps>
+
+## Export Settings
+
+Use **File → Export → glTF 2.0 (.glb/.gltf)** and match the settings below exactly. Draco compression and the `+Y Up` transform are the two most commonly missed options.
+
+```
+File → Export → glTF 2.0 (.glb/.gltf)
+
+Format:        glTF Binary (.glb)
+Include:       ☑ Selected Objects only
+Transform:     ☑ +Y Up
+Mesh:          ☑ Apply Modifiers
+               ☑ UVs
+               ☑ Normals
+               ☐ Tangents (skip)
+Material:      ☑ Materials (PBR)
+               Image: JPEG (or PNG if transparency)
+Animation:     ☐ (skip unless cloth sim)
+Compression:   ☑ Draco (60-80% size reduction)
+```
+
+<Tip>
+  Draco compression reduces `.glb` file sizes by 60–80% with no perceptible loss in visual quality. It is supported by Mirror Fit's renderer (`model_viewer_plus`) on both Android and iOS — always leave it enabled.
+</Tip>
+
+## Polygon Budget
+
+Keep models within these ranges. Going over the **Full Suit** ceiling of 50K polygons will cause visible frame drops on mid-range devices.
+
+| Garment Type | Target Polys | File Size     |
+| ------------ | ------------ | ------------- |
+| T-Shirt      | 5K – 15K     | 200KB – 500KB |
+| Button Shirt | 10K – 25K    | 300KB – 1MB   |
+| Jacket       | 15K – 35K    | 500KB – 2MB   |
+| Dress        | 15K – 40K    | 500KB – 2MB   |
+| Full Suit    | 25K – 50K    | 1MB – 3MB     |
+
+## Texture Optimisation
+
+Textures typically account for the majority of a `.glb` file's size. Follow these rules to stay within budget:
+
+- **Maximum size:** 1024 × 1024 px. Use 2048 × 2048 only for hero garments where surface detail is critical.
+- **Format:** JPEG for fully opaque surfaces; PNG only when the garment requires transparency (e.g. mesh fabrics, sheer overlays).
+- **Baking:** Complex procedural materials (Principled BSDF nodes with many inputs) must be baked to simple PBR texture maps before export. Blender's **Cycles bake** workflow (`Properties → Render → Bake`) is the recommended path.
+- **Required maps:** Base Color. Normal and Roughness maps are optional but improve realism at low extra cost.
+
+## Placing Models in the App
+
+Drop finished `.glb` files into `assets/models/` inside the project root. The directory is already registered in `pubspec.yaml`, so Flutter will bundle every file inside it automatically — no further configuration is needed per model.
+
+```
+Mirror_Fit/
+└── assets/
+    └── models/
+        ├── jacket.glb   ← existing example
+        └── your_garment.glb
+```
+
+The `assets/models/` directory is declared in `pubspec.yaml` as:
+
+```yaml
+flutter:
+  assets:
+    - assets/models/
+```
+
+Reference a model in Dart using its asset path, for example `assets/models/jacket.glb`, and pass it to `ModelViewer` or the `ModelLoader` service in `lib/ar_tryon/rendering/model_loader.dart`.

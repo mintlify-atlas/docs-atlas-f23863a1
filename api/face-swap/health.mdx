@@ -1,0 +1,128 @@
+---
+title: "GET /health — Face Swap Backend Health Check"
+sidebarTitle: "GET /health"
+description: "GET /health returns a JSON status object confirming the face-swap backend is running and its loaded models are ready."
+---
+
+The `/health` endpoint is the liveness check for the LUCY AI face-swap backend running on port 8000. Call it before sending any swap or avatar requests to confirm that the server has started successfully and that its ONNX models are loaded and available. It reports each optional engine and weight file individually, so a missing model file is one `curl` away from being diagnosed rather than requiring a full test swap to discover.
+
+## Request
+
+`GET /health`
+
+No parameters, no request body.
+
+## Response
+
+The endpoint always returns `200 OK` with a JSON body. The fields map directly to the server's internal state at the moment of the call.
+
+<ResponseField name="status" type="string">
+  Always `"ok"` when the server is running. This field being present means
+  the HTTP layer is alive; check `models_loaded` for GPU readiness.
+</ResponseField>
+
+<ResponseField name="models_loaded" type="boolean">
+  `true` when the V1 inswapper ONNX model (`inswapper_128.onnx`) has been
+  loaded into memory. `false` in `LUCY_MINIMAL_MODE=1` or when the model
+  file is absent.
+</ResponseField>
+
+<ResponseField name="engines" type="object">
+  Per-engine readiness flags.
+
+  <Expandable title="engines fields">
+    <ResponseField name="v1" type="boolean">
+      V1 pipeline is ready (InsightFace buffalo\_l + inswapper\_128 + Haar
+      cascade loaded). Used by `/ws/live-swap`, `/face-swap`, and
+      `/face-swap/with-avatar`.
+    </ResponseField>
+    <ResponseField name="v2" type="boolean">
+      V2 pipeline is ready (inswapper\_128\_fp16 + GFPGANv1.4 ONNX loaded).
+      Used by `/ws/live-swap-v2`. Requires both V2 weight files to be
+      present on disk.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="optional" type="object">
+  Flags for optional enhancement models that are loaded on top of the core
+  swap engine.
+
+  <Expandable title="optional fields">
+    <ResponseField name="codeformer" type="boolean">
+      CodeFormer ONNX face-restoration model is loaded. When `true`,
+      every swap frame is sharpened by CodeFormer at 512 px before delivery.
+    </ResponseField>
+    <ResponseField name="face_parser" type="boolean">
+      BiSeNet face-parser ONNX is loaded. Required for hair-swap and the
+      changed-pixel mask sent alongside hair-enabled frames.
+    </ResponseField>
+    <ResponseField name="wav2lip" type="boolean">
+      Wav2Lip GAN ONNX is loaded. Required for audio-driven lip-sync in the
+      `/ws/live-swap` loop and for the `/lipsync/generate` endpoint.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="v2_weights" type="object">
+  On-disk presence and byte-size of the two V2 model files. Useful for
+  diagnosing a `false` `engines.v2` flag.
+
+  <Expandable title="v2_weights fields">
+    <ResponseField name="inswapper_128_fp16.onnx" type="object">
+      `{ "present": boolean, "bytes": integer }` — the FP16 inswapper weight
+      (expected 277,680,638 bytes). The server auto-downloads it from
+      HuggingFace on first boot unless `LUCY_AUTO_DOWNLOAD=0`.
+    </ResponseField>
+    <ResponseField name="GFPGANv1.4.onnx" type="object">
+      `{ "present": boolean, "bytes": integer }` — the GFPGAN v1.4 ONNX
+      weight (expected 340,256,686 bytes). Also auto-downloaded on first
+      boot.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="auto_download" type="boolean">
+  Reflects the `LUCY_AUTO_DOWNLOAD` environment variable. When `true` the
+  server fetches missing V2 weights from HuggingFace on startup. Set
+  `LUCY_AUTO_DOWNLOAD=0` on air-gapped boxes.
+</ResponseField>
+
+<ResponseField name="clone_mode" type="string">
+  Active Poisson-clone mode for the V1 pipeline. One of `"normal"`,
+  `"mixed"`, or `"alpha"`. Controlled by the `LUCY_CLONE_MODE` environment
+  variable.
+</ResponseField>
+
+## Example
+
+```bash
+curl http://localhost:8000/health
+```
+
+```json
+{
+  "status": "ok",
+  "models_loaded": true,
+  "engines": {
+    "v1": true,
+    "v2": true
+  },
+  "optional": {
+    "codeformer": true,
+    "face_parser": true,
+    "wav2lip": false
+  },
+  "v2_weights": {
+    "inswapper_128_fp16.onnx": { "present": true, "bytes": 277680638 },
+    "GFPGANv1.4.onnx":         { "present": true, "bytes": 340256686 }
+  },
+  "auto_download": true,
+  "clone_mode": "normal"
+}
+```
+
+<Note>
+  The backend runs on **port 8000**. The demo UI is served separately on port
+  7860. Health checks should always target port 8000.
+</Note>

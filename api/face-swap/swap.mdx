@@ -1,0 +1,148 @@
+---
+title: "POST /face-swap and POST /fashn/run Endpoints"
+sidebarTitle: "POST /face-swap"
+description: "POST /face-swap swaps a face in an uploaded image. POST /fashn/run proxies try-on to FASHN.ai. Both return JPEG image data."
+---
+
+There are two distinct swap endpoints in this backend. `/face-swap` performs a direct, single-shot face swap using the local InsightFace + inswapper pipeline and returns the result immediately as JPEG bytes. `/fashn/run` is a proxy endpoint for one-shot HD garment try-on via the external FASHN.ai API; it is designed for manager presentations where high output quality matters more than latency. A third endpoint, `/face-swap/with-avatar`, wraps the same local pipeline but resolves the source image from the server's avatar catalogue by ID rather than requiring the caller to upload it.
+
+---
+
+## POST /face-swap
+
+Swaps the face from `source` onto the body in `target`. The server auto-detects whether the source is a photorealistic image or a cartoon and routes to the appropriate pipeline (`_swap_real` for photos, `_swap_geometric` for cartoons/anime).
+
+**Request format:** `multipart/form-data`
+
+<ParamField body="source" type="file" required>
+  The source image containing the face to transplant. Accepted formats: JPEG,
+  PNG, WebP — any format OpenCV's `imdecode` can handle. The largest detected
+  face in this image is used as the identity source.
+</ParamField>
+
+<ParamField body="target" type="file" required>
+  The target image whose face will be replaced. The largest detected face in
+  this image determines where the swap is pasted back.
+</ParamField>
+
+**Response:** `200 OK` — `image/jpeg` bytes of the composited result.
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | One of the uploaded files could not be decoded as an image. |
+| `422` | A face could not be detected in the source or target image. |
+| `500` | The inswapper inference or Poisson clone step failed internally. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/face-swap \
+  -F "source=@avatar.jpg" \
+  -F "target=@photo.jpg" \
+  --output swapped.jpg
+```
+
+---
+
+## POST /fashn/run
+
+Proxies a one-shot HD garment try-on request to the [FASHN.ai](https://fashn.ai) API. The server holds the `FASHN_API_KEY` in its environment so the key is never sent to the browser. The endpoint submits the job, polls `/status` until completion (up to 90 seconds), and returns the output URL list. Typical round-trip latency is 10–25 seconds.
+
+**Request format:** `application/json`
+
+<ParamField body="model_image" type="string" required>
+  The person image. Accepts a base64-encoded JPEG string, a
+  `data:image/jpeg;base64,…` data URI, or a publicly reachable HTTPS URL.
+</ParamField>
+
+<ParamField body="garment_image" type="string" required>
+  The garment image. Same format options as `model_image`.
+</ParamField>
+
+<ParamField body="category" type="string">
+  The garment category sent to FASHN.ai. Defaults to `"auto"` when omitted.
+  Refer to FASHN.ai docs for accepted values (`"tops"`, `"bottoms"`,
+  `"one-pieces"`, etc.).
+</ParamField>
+
+**Response:** `200 OK` — JSON object.
+
+<ResponseField name="output" type="array">
+  Array of output image URLs returned by FASHN.ai on success. Empty on failure.
+</ResponseField>
+
+<ResponseField name="error" type="string | null">
+  Error message from FASHN.ai if the job failed. `null` on success.
+</ResponseField>
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `400` | `model_image` or `garment_image` was not supplied. |
+| `500` | `FASHN_API_KEY` environment variable is not set on the server. |
+| `502` | The FASHN.ai API returned an error or was unreachable. |
+| `504` | The FASHN.ai job did not complete within 90 seconds. |
+
+<Note>
+  The `FASHN_API_KEY` environment variable must be set on the server before
+  starting the backend. The key is never forwarded to the client.
+</Note>
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/fashn/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_image": "data:image/jpeg;base64,/9j/4AAQ...",
+    "garment_image": "https://example.com/shirt.jpg",
+    "category": "tops"
+  }'
+```
+
+```json
+{
+  "output": ["https://cdn.fashn.ai/results/abc123.jpg"],
+  "error": null
+}
+```
+
+---
+
+## POST /face-swap/with-avatar
+
+Identical to `POST /face-swap` but the source image is resolved from the server's avatar catalogue by ID. Both preset avatars (`gen_f_01`–`gen_m_05`, etc.) and user-enrolled avatars (`usr_*`) are supported.
+
+**Request format:** `multipart/form-data`
+
+<ParamField body="target" type="file" required>
+  The target image whose face will be replaced. Any image format that OpenCV
+  can decode.
+</ParamField>
+
+<ParamField body="avatar_id" type="string" required>
+  The ID of the avatar to use as the face source. Must exist in the avatar
+  catalogue. Use `GET /avatars` to enumerate valid IDs.
+</ParamField>
+
+**Response:** `200 OK` — `image/jpeg` bytes of the composited result.
+
+**Error codes:**
+
+| Code | Meaning |
+|------|---------|
+| `404` | `avatar_id` not found in the catalogue, or the avatar's image file has not been generated yet. |
+| `422` | A face could not be detected. |
+| `500` | Internal swap failure. |
+
+### Example
+
+```bash
+curl -X POST http://localhost:8000/face-swap/with-avatar \
+  -F "avatar_id=gen_f_01" \
+  -F "target=@photo.jpg" \
+  --output result.jpg
+```

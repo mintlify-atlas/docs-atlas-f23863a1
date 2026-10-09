@@ -1,47 +1,261 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Mirror Fit"
+sidebarTitle: "Quickstart"
+description: "Install Mirror Fit, download the ML models, start the backend services, and run the Flutter app on your device in under 15 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide walks you through cloning Mirror Fit, placing the required ML model assets, configuring API credentials, and launching both the Flutter app and the self-hosted GPU backends. The on-device AR try-on features work offline once the app is running; the AI face-swap and diffusion try-on features additionally require the Python backends described at the end of this page.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Prerequisites">
+    Ensure the following tools are installed before you begin:
+
+    | Requirement | Minimum version | Notes |
+    |---|---|---|
+    | Flutter SDK | ≥ 3.10.1 | Matches `environment.sdk: ^3.10.1` in `pubspec.yaml` |
+    | Dart | Included with Flutter | No separate install needed |
+    | Python | 3.11 | Required for GPU backends |
+    | Conda / Miniconda | Any recent | Used by `start_all.ps1` to isolate backend environments |
+    | Physical Android or iOS device | Android API 24+ / iOS 12+ | Emulators do not support the live camera stream |
+
+    Verify your Flutter installation:
 
     ```bash
-    npm install your-package
+    flutter doctor
+    flutter --version
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Clone and Install Flutter Dependencies">
+    Clone the repository and fetch all Dart packages declared in `pubspec.yaml`:
 
     ```bash
-    your-cli init
+    git clone https://github.com/indwar7/Mirror_Fit.git
+    cd Mirror_Fit
+    flutter pub get
     ```
+
+    Key packages that `flutter pub get` will resolve:
+
+    | Package | Version | Purpose |
+    |---|---|---|
+    | `camera` | `^0.12.0+1` | Real-time camera stream for AR pipeline |
+    | `model_viewer_plus` | `^1.8.1` | 3D `.glb` garment viewer |
+    | `provider` | `^6.1.2` | App-wide state management |
+    | `flutter_inappwebview` | `^6.1.5` | WebRTC camera streaming via WebView (Decart) |
+    | `google_fonts` | `^8.0.2` | Poppins / Inter typefaces |
+    | `image_picker` | `^1.0.7` | Photo upload for avatar generation |
+    | `http` | `^1.2.0` | REST calls to the GPU backends |
+    | `shared_preferences` | `^2.2.2` | Persisted user preferences |
+    | `animate_do` | `^3.3.4` | Entry animations |
+    | `confetti` | `^0.7.0` | Fit-score celebration effect |
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Download the Segmentation Model">
+    The body segmentation stage (`lib/ar_tryon/segmentation/body_segmenter.dart`) requires a TFLite model file that is **not bundled in the repository** due to size. Download and place it at:
+
+    ```
+    assets/ml_models/selfie_segmentation.tflite
+    ```
+
+    Two options are supported:
+
+    ```
+    selfie_segmentation.tflite       (~300 KB)   fast — recommended for mid-range devices
+    deeplabv3_257_mv_gpu.tflite      (~2.7 MB)   more accurate — better for high-end devices
+    ```
+
+    The MediaPipe Selfie Segmentation model (`selfie_segmentation.tflite`) is the primary target. It runs at 256×256 with a GPU delegate for a 3–5× speedup over CPU inference, producing a per-pixel probability mask where `0 = background` and `255 = body`.
+
+    <Tip>
+      Download the model directly from the [MediaPipe Models page](https://developers.google.com/mediapipe/solutions/vision/image_segmenter) or from the TensorFlow Hub. Place the file exactly at `assets/ml_models/` — this path is declared as a Flutter asset in `pubspec.yaml`.
+    </Tip>
+  </Step>
+
+  <Step title="Add Garment Models">
+    The AR pipeline loads `.glb` (glTF Binary) files from the `assets/models/` directory, which is already declared as a Flutter asset folder in `pubspec.yaml`. A sample jacket model is included at `assets/models/jacket.glb`.
+
+    To add your own garments, place optimised `.glb` files in that folder:
+
+    ```
+    assets/
+    └── models/
+        ├── jacket.glb          ← included sample
+        ├── tshirt.glb          ← your garment
+        └── dress.glb           ← your garment
+    ```
+
+    **Polygon budget guidelines from the project:**
+
+    | Garment | Target polygons | Approximate file size |
+    |---|---|---|
+    | T-Shirt | 5 K – 15 K | 200 KB – 500 KB |
+    | Button Shirt | 10 K – 25 K | 300 KB – 1 MB |
+    | Jacket | 15 K – 35 K | 500 KB – 2 MB |
+    | Full Suit | 25 K – 50 K | 1 MB – 3 MB |
+
+    Export from Blender using **File → Export → glTF 2.0 (.glb)** with `+Y Up`, `Apply Modifiers`, and Draco compression enabled for a 60–80% size reduction. Keep textures at or below 1024×1024 px.
+  </Step>
+
+  <Step title="Configure API Keys">
+    Two external API tokens are required for the cloud-assisted try-on features (Replicate and Decart). They are read from Dart compile-time environment variables — **not** from source files:
 
     ```bash
-    your-cli start
+    flutter run \
+      --dart-define=REPLICATE_API_TOKEN=r8_... \
+      --dart-define=DECART_API_KEY=dck_...
+    ```
+
+    For a release build:
+
+    ```bash
+    flutter build apk \
+      --dart-define=REPLICATE_API_TOKEN=r8_... \
+      --dart-define=DECART_API_KEY=dck_...
+    ```
+
+    Inside the app the values are consumed via `String.fromEnvironment`:
+
+    ```dart
+    // lib/services/replicate_tryon_service.dart
+    final token = String.fromEnvironment('REPLICATE_API_TOKEN');
+
+    // lib/services/decart_tryon_service.dart
+    final key = String.fromEnvironment('DECART_API_KEY');
+    ```
+
+    <Warning>
+      `--dart-define` keeps secrets out of source control but they are **baked into the compiled binary** — anyone with `strings` or a decompiler can extract them from the `.apk` or `.ipa`. The durable fix is to proxy these calls through the self-hosted backend (as `FASHN_API_KEY` already does correctly in `face_swap_backend/main.py`), not yet applied to the Flutter client. Never commit key values to `pubspec.yaml` or any Dart source file.
+    </Warning>
+
+    The Hugging Face token for the try-on backend is a **server-side** secret set as an environment variable on the GPU box — it is never passed to the Flutter app:
+
+    ```powershell
+    # Windows — set permanently across sessions
+    [Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_...", "Machine")
     ```
   </Step>
+
+  <Step title="Run on Device">
+    Connect a physical Android or iOS device, verify it is detected, then launch the app:
+
+    ```bash
+    flutter devices          # confirm your device appears
+    flutter run              # builds debug and deploys
+    ```
+
+    The app launches as **LUCY** (defined in `lib/main.dart` as `title: 'LUCY'`). From the home screen, tap **Real-Time AR Try-On** to open the live AR camera view.
+
+    For a release build optimised for performance (recommended when testing the AR pipeline):
+
+    ```bash
+    flutter run --release
+    ```
+
+    <Note>
+      The app is locked to portrait orientation (`DeviceOrientation.portraitUp` and `portraitDown`) by `SystemChrome.setPreferredOrientations` in `main()`. Landscape mode is not supported in the current build.
+    </Note>
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Platform Configuration
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+<Tabs>
+  <Tab title="Android">
+    Edit `android/app/src/main/AndroidManifest.xml` to add the camera permission:
+
+    ```xml
+    <manifest ...>
+      <uses-permission android:name="android.permission.CAMERA" />
+
+      <application ...>
+        ...
+      </application>
+    </manifest>
+    ```
+
+    Set the minimum SDK version in `android/app/build.gradle`:
+
+    ```groovy
+    android {
+      defaultConfig {
+        minSdkVersion 24    // recommended for full TFLite GPU delegate support
+        targetSdkVersion 34
+      }
+    }
+    ```
+
+    A `minSdkVersion` of 21 satisfies the MLKit requirement, but 24 is recommended for the best TFLite GPU delegate coverage.
+  </Tab>
+  <Tab title="iOS">
+    Add the camera usage description to `ios/Runner/Info.plist`:
+
+    ```xml
+    <dict>
+      ...
+      <key>NSCameraUsageDescription</key>
+      <string>Mirror Fit uses the camera for real-time garment try-on.</string>
+      ...
+    </dict>
+    ```
+
+    Verify the deployment target in `ios/Podfile`:
+
+    ```ruby
+    platform :ios, '12.0'
+    ```
+
+    iOS 12.0 is the minimum for MLKit. The TFLite Metal (GPU) delegate is automatically enabled on iOS — no additional configuration is required.
+  </Tab>
+</Tabs>
+
+## Starting the Backends
+
+The GPU backends are optional for the on-device AR try-on but are required for AI face swap, diffusion-based garment generation, live portrait, and AI twin features.
+
+<CodeGroup>
+
+```powershell PowerShell (start_all.ps1)
+# Start all backends that are currently down (safe to re-run):
+cd C:\virtual-try-on
+powershell -ExecutionPolicy Bypass .\start_all.ps1
+
+# Start only the try-on backend:
+powershell -ExecutionPolicy Bypass .\start_all.ps1 -Only tryon
+
+# Force-restart even if a service is already up:
+powershell -ExecutionPolicy Bypass .\start_all.ps1 -Force
+```
+
+```bash Individual uvicorn commands
+# Face Swap Backend (port 7860)
+cd face_swap_backend
+uvicorn main:app --host 0.0.0.0 --port 7860
+
+# Live Try-On Backend (port 8000) — requires HF_TOKEN in environment
+cd tryon_backend
+uvicorn server:app --host 0.0.0.0 --port 8000
+
+# Serve the demo UI without loading GPU models (dev only)
+cd demo
+python -m http.server 7860
+```
+
+</CodeGroup>
+
+The `start_all.ps1` script manages four services:
+
+| Service | Port | Entry point | Conda env |
+|---|---|---|---|
+| `face-swap` | 7860 | `face_swap_backend/main.py` | `C:\miniconda3\python.exe` (shared) |
+| `live-portrait` | 7862 | `liveportrait_backend/server.py` | `envs\liveportrait` |
+| `try-on` | 8000 | `tryon_backend/server.py` | `C:\miniconda3\python.exe` (shared) |
+| `ai-twin` | 7863 | `sadtalker_backend/server.py` | `envs\sadtalker` |
+
+Once started, check logs at `C:\logs\<service-name>.log` and `C:\logs\<service-name>.err.log`.
+
+<Tip>
+  The **AR Avatar**, **Fit Analyser**, and **Returns Guard** tabs run entirely in the browser and require no backend process. Only the face-swap, live try-on, live portrait, and AI twin features depend on the GPU box being reachable.
 </Tip>

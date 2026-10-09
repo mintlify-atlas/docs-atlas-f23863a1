@@ -1,0 +1,255 @@
+---
+title: "Deploying Mirror Fit Backends on a GPU Server"
+sidebarTitle: "Deployment"
+description: "How to deploy Mirror Fit's three AI backends on a Windows GPU instance (AWS g5.xlarge A10G) with conda environments, process management, and log monitoring."
+---
+
+Mirror Fit targets an AWS **g5.xlarge** instance running Windows Server with an NVIDIA A10G GPU (24 GB VRAM). All three backends — face-swap, live try-on, and InstantID — share this single GPU. The `start_all.ps1` script at the project root manages the full process lifecycle: it checks which ports are already bound, starts only the backends that are down, creates Windows Firewall inbound rules automatically, and waits up to 120 seconds for model loads before reporting status. The deploy workflow in `.github/workflows/deploy.yml` calls `start_all.ps1 -Force` on every push to `main` via a self-hosted runner on the GPU box.
+
+## Server Requirements
+
+| Requirement | Specification |
+|---|---|
+| GPU | NVIDIA A10G, 24 GB VRAM minimum for all three backends simultaneously |
+| OS | Windows Server (backends use PowerShell `.ps1` scripts for setup and process management) |
+| Package manager | [Miniconda](https://docs.conda.io/en/latest/miniconda.html) at `C:\miniconda3` |
+| Repo location | `C:\virtual-try-on` |
+| Log directory | `C:\logs` |
+| Python (base env) | 3.14 (face-swap + try-on backends) |
+| Python (instantid env) | 3.11 (InstantID backend — CUDA PyTorch wheels require this) |
+
+## Conda Environments
+
+<Tabs>
+  <Tab title="Table">
+    | Environment | Path | Used by | Notes |
+    |---|---|---|---|
+    | `base` | `C:\miniconda3\python.exe` | face-swap (port 7860), live try-on (port 8000) | Shared env; `mediapipe`, `insightface`, `diffusers`, `controlnet_aux` all installed here |
+    | `instantid` | `C:\miniconda3\envs\instantid\python.exe` | InstantID (port 7861) | Python 3.11 required for PyTorch CUDA wheels |
+    | `liveportrait` | `C:\miniconda3\envs\liveportrait\python.exe` | LivePortrait (port 7862) | Isolated env for LivePortrait backend |
+    | `sadtalker` | `C:\miniconda3\envs\sadtalker\python.exe` | AI Twin / SadTalker (port 7863) | Isolated env for SadTalker backend |
+  </Tab>
+  <Tab title="Verify">
+    ```powershell
+    conda env list
+    # Should show: base, instantid, liveportrait, sadtalker
+    
+    & C:\miniconda3\envs\instantid\python.exe --version
+    # Python 3.11.x
+    
+    & C:\miniconda3\python.exe --version
+    # Python 3.14.x (or whatever the base is)
+    ```
+  </Tab>
+</Tabs>
+
+## Starting Backends
+
+`start_all.ps1` is the single authoritative way to start Mirror Fit backends. It is safe to re-run: backends that are already serving are left alone so a running session is never interrupted. Use `-Force` to kill and restart a backend.
+
+```powershell
+cd C:\virtual-try-on
+
+# Start everything that is currently down:
+powershell -ExecutionPolicy Bypass .\start_all.ps1
+
+# Restart everything even if already running:
+powershell -ExecutionPolicy Bypass .\start_all.ps1 -Force
+
+# Start only one backend:
+powershell -ExecutionPolicy Bypass .\start_all.ps1 -Only tryon
+powershell -ExecutionPolicy Bypass .\start_all.ps1 -Only face-swap
+powershell -ExecutionPolicy Bypass .\start_all.ps1 -Only live-portrait
+```
+
+The script checks each service in this order:
+
+<Steps>
+  <Step title="Pre-flight checks">
+    - Warns (but does not abort) if `HF_TOKEN` is not set — the try-on backend needs it to fetch CatVTON weights.
+    - Skips any backend whose folder or Python interpreter is missing, printing a clear message naming which `setup.ps1` to run.
+  </Step>
+  <Step title="Start processes">
+    For each backend that needs to start:
+    1. Creates a Windows Firewall inbound rule for the backend's port.
+    2. Starts the Python process in a hidden window via `Start-Process`.
+    3. Redirects stdout → `C:\logs\<name>.log` and stderr → `C:\logs\<name>.err.log`.
+  </Step>
+  <Step title="Wait for readiness">
+    Polls each started backend's port every 5 seconds, up to 120 seconds, printing `N of M listening` until all ports respond (or the deadline expires). Model loads are lazy for some backends, so the port may answer before inference is warm.
+  </Step>
+  <Step title="Print status table">
+    Reports each service as `UP` (green) or `DOWN` (red), showing the last 3 lines of its `.err.log` if down.
+
+    ```
+    ─── status ───────────────────────────────────
+      face-swap       :7860  UP       Live Face Swap, My Avatar
+      live-portrait   :7862  UP       Live Portrait
+      try-on          :8000  UP       Live Try-On
+      ai-twin         :7863  DOWN     AI Twin
+            RuntimeError: sadtalker model not found
+    ```
+  </Step>
+</Steps>
+
+### Managed Services
+
+| Name | Port | Entry | Python interpreter | Flutter tabs |
+|---|---|---|---|---|
+| `face-swap` | 7860 | `face_swap_backend/main.py` | `C:\miniconda3\python.exe` | Live Face Swap, My Avatar |
+| `live-portrait` | 7862 | `liveportrait_backend/server.py` | `C:\miniconda3\envs\liveportrait\python.exe` | Live Portrait |
+| `try-on` | 8000 | `tryon_backend/server.py` | `C:\miniconda3\python.exe` | Live Try-On |
+| `ai-twin` | 7863 | `sadtalker_backend/server.py` | `C:\miniconda3\envs\sadtalker\python.exe` | AI Twin |
+
+<Note>
+  Three Flutter tabs — **AR Avatar**, **Fit Analyser**, and **Returns Guard** — require no backend at all. They run entirely in the browser/Flutter app.
+</Note>
+
+## Environment Variables
+
+### HF_TOKEN (Required for Try-On)
+
+`$env:HF_TOKEN = "hf_..."` only lasts the current PowerShell session. Set it permanently at the Machine scope so it survives reboots and is visible to the backend processes started by `start_all.ps1`:
+
+```powershell
+[Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_...", "Machine")
+
+# Close and reopen PowerShell, then verify:
+[Environment]::GetEnvironmentVariable("HF_TOKEN", "Machine")
+```
+
+The `deploy.yml` GitHub Actions workflow passes `HF_TOKEN` from a repository secret into the runner environment:
+
+```yaml
+- name: Restart backends
+  env:
+    HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  run: |
+    & powershell -ExecutionPolicy Bypass -File "$env:APP_DIR\start_all.ps1" -Force
+```
+
+If the secret is empty, `start_all.ps1` warns: `HF_TOKEN is not set. Try-On needs it to fetch model weights.` — and the tryon backend silently falls back to a tier that does not apply the garment mask correctly.
+
+### Other Variables
+
+```powershell
+# Face-swap backend (set before start_all.ps1 or in the system environment):
+[Environment]::SetEnvironmentVariable("FASHN_API_KEY",      "fsh_...",                "Machine")
+[Environment]::SetEnvironmentVariable("LUCY_INSTANTID_URL", "http://127.0.0.1:7861",  "Machine")
+
+# Optional face-swap quality tuning:
+[Environment]::SetEnvironmentVariable("LUCY_IDENTITY_BOOST",    "1.3",    "Machine")
+[Environment]::SetEnvironmentVariable("LUCY_CLONE_MODE",        "normal", "Machine")
+[Environment]::SetEnvironmentVariable("LUCY_HAIR_SWAP",         "1",      "Machine")
+[Environment]::SetEnvironmentVariable("LUCY_MOUTH_MASK",        "1",      "Machine")
+[Environment]::SetEnvironmentVariable("LUCY_CODEFORMER_EVERY",  "1",      "Machine")
+
+# Skip all GPU model loads on the face-swap backend (frees ~3-4 GB for InstantID):
+[Environment]::SetEnvironmentVariable("LUCY_MINIMAL_MODE", "1", "Machine")
+```
+
+## Log Monitoring
+
+All backend logs are written to `C:\logs\`:
+
+```powershell
+# Live try-on backend:
+Get-Content C:\logs\try-on.err.log -Tail 30
+Get-Content C:\logs\try-on.log     -Tail 30
+
+# Face-swap backend:
+Get-Content C:\logs\face-swap.err.log -Tail 30
+Get-Content C:\logs\face-swap.log     -Tail 30
+
+# Search for GPU VRAM readings:
+Get-Content C:\logs\try-on.log | Select-String "gpu/"
+
+# Follow a log in real time (-Wait is PowerShell's equivalent of tail -f):
+Get-Content C:\logs\try-on.err.log -Tail 10 -Wait
+```
+
+The try-on backend calls `_log_gpu()` at startup to record free/total VRAM. Look for lines like:
+```
+[gpu/before-load] NVIDIA A10G free=22.3GiB of 23.7GiB (torch 2.3.1, cuda 12.1)
+[gpu/after-load]  NVIDIA A10G free=9.1GiB  of 23.7GiB ...
+```
+
+The face-swap backend enables `faulthandler` so native CUDA crashes produce a Python stack trace in the log instead of a silent process exit.
+
+## Firewall & Security Group
+
+`start_all.ps1` automatically creates Windows Firewall inbound rules for each backend's port when it starts the process:
+
+```powershell
+New-NetFirewallRule -DisplayName "Allow 8000" -Direction Inbound `
+    -LocalPort 8000 -Protocol TCP -Action Allow
+```
+
+If you need to add rules manually:
+
+```powershell
+# Open all backend ports:
+foreach ($port in @(7860, 7861, 7862, 7863, 8000)) {
+    New-NetFirewallRule -DisplayName "Allow $port" -Direction Inbound `
+        -LocalPort $port -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+}
+```
+
+<Warning>
+  The Windows Firewall rule alone is **not sufficient** if the instance is behind an AWS security group. The EC2 security group also needs inbound rules for each port. The current box (`13.126.77.241`, ap-south-1) has ports 7860 and 8000 open to `0.0.0.0/0` for testing. Review which ports are meant to be open long-term before exposing the box to the internet permanently.
+
+  Additionally, the **public IP changes on every instance stop/start** — no Elastic IP is attached. If you stop and restart the g5.xlarge to save cost, update any hardcoded IP references in your development environment or attach an Elastic IP.
+</Warning>
+
+## Testing the Demo
+
+Serve the static `demo/` folder directly to avoid loading the full face-swap backend (which loads heavy GPU models) just to serve an HTML file:
+
+<Steps>
+  <Step title="Open the firewall port">
+    ```powershell
+    New-NetFirewallRule -DisplayName "Allow 7860" -Direction Inbound `
+        -LocalPort 7860 -Protocol TCP -Action Allow
+    ```
+  </Step>
+  <Step title="Serve demo/  with Python's built-in HTTP server">
+    ```powershell
+    cd C:\virtual-try-on\demo
+    & C:\miniconda3\python.exe -m http.server 7860
+    ```
+    The static server's root is the `demo/` folder, so `http://<ip>:7860/` opens the demo directly.
+  </Step>
+  <Step title="Open in browser">
+    Navigate to `http://<server-ip>:7860/` and click **Live Try-On**.
+
+    Use `http://localhost:7860/` if testing directly on the GPU box — `localhost` bypasses Chrome's insecure-origin camera restriction entirely.
+  </Step>
+</Steps>
+
+<Warning>
+  **Chrome blocks camera access (`getUserMedia`) on any plain `http://` origin that is not `localhost`.** A remote IP over HTTP is treated as an insecure origin, so the camera permission prompt will not appear.
+
+  Dev-only workaround (this machine's Chrome only):
+  1. Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
+  2. Enable the flag and add: `http://<server-ip>:7860,http://<server-ip>:8000`
+  3. Click **Relaunch**
+
+  The durable fix is serving over HTTPS (e.g. via an NGINX reverse proxy with a self-signed cert, or by attaching a domain + Let's Encrypt certificate).
+</Warning>
+
+## CI/CD Deployment
+
+The `.github/workflows/deploy.yml` workflow runs on every push to `main` using a self-hosted runner on the GPU box:
+
+```yaml
+- name: Pull latest code
+  run: git -C $env:APP_DIR pull origin main
+
+- name: Restart backends
+  env:
+    HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  run: |
+    & powershell -ExecutionPolicy Bypass -File "$env:APP_DIR\start_all.ps1" -Force
+```
+
+`-Force` kills only the process holding each service's port (not all Python processes on the box), so a push by one person does not kill another person's debugging session. The `HF_TOKEN` is injected from the `HF_TOKEN` repository secret at deploy time.

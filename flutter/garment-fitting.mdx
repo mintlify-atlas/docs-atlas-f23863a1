@@ -1,0 +1,196 @@
+---
+title: "Garment Fitting Algorithm and Transform Calculation"
+sidebarTitle: "Garment Fitting"
+description: "How Mirror Fit maps detected body landmarks to garment transforms: width scaling, rotation, perspective correction, and temporal smoothing."
+---
+
+Every camera frame that contains a valid pose produces a `GarmentTransform` — the position, scale, and rotation needed to overlay the selected garment on the detected body. `GarmentFitter` (`fitting/garment_fitter.dart`) performs this computation in pure Dart, taking roughly 1 ms per frame. It is designed to be Snapchat-grade: the garment scales naturally with the person's distance from the camera (no minimum width clamp), rotates with shoulder tilt, and uses the real torso height whenever hips are visible for perspective-correct scaling.
+
+---
+
+## Fitting Formula
+
+### Tops (`GarmentType.top`)
+
+```
+shoulderWidth  = distance2D(leftShoulder, rightShoulder)
+garmentWidth   = shoulderWidth × shoulderPadding          (default 1.4)
+scaleX         = garmentWidth / garmentConfig.originalWidth
+
+torsoHeightPx  = distance(shoulderCenter, hipCenter)      (real landmarks when visible)
+               = shoulderWidth × 1.4                       (anatomical estimate if hips hidden)
+bodyFraction   = 1.0 - shoulderLineInImage - 0.05
+garmentHeight  = max(torsoHeightPx × 1.10 / bodyFraction,
+                     garmentWidth × aspectRatio)
+scaleY         = garmentHeight / garmentConfig.originalHeight
+
+anchorX        = shoulderCenterX
+anchorY        = shoulderCenterY + garmentHeight × (0.5 - shoulderLineInImage)
+               // Positions the shoulder seam in the image over the detected shoulder midpoint
+```
+
+### Bottoms (`GarmentType.bottom`)
+
+```
+garmentWidth   = hipWidth × 1.1
+garmentHeight  = torsoHeight × 1.2
+anchorX        = hipMidpointX
+anchorY        = hipMidpointY
+```
+
+### Full Body (`GarmentType.fullBody`)
+
+```
+garmentWidth   = shoulderDistance × shoulderPadding
+garmentHeight  = torsoHeight × 2.2   // shoulder to knee
+anchorX        = shoulderMidpointX
+anchorY        = shoulderMidpointY + garmentHeight × (0.5 - shoulderLineInImage)
+```
+
+### Rotation
+
+```
+shoulderAngle  = atan2(rightShoulder.y - leftShoulder.y,
+                       rightShoulder.x - leftShoulder.x) × (180 / π)
+rotation       = shoulderAngle.clamp(-15°, +15°)
+```
+
+### Temporal Smoothing (per frame)
+
+```
+transform.x       = prev.x       + (curr.x       - prev.x)       × 0.20
+transform.y       = prev.y       + (curr.y       - prev.y)       × 0.20
+transform.scaleX  = prev.scaleX  + (curr.scaleX  - prev.scaleX)  × 0.20
+transform.scaleY  = prev.scaleY  + (curr.scaleY  - prev.scaleY)  × 0.20
+transform.rotation= prev.rotation+ (curr.rotation- prev.rotation) × 0.20
+```
+
+An alpha of `0.20` means 20% toward the new value per frame — roughly a 15-frame settle time at 30 FPS. Landmarks are already One-Euro filtered upstream by MLKit, so this secondary smoothing suppresses scale and position noise without introducing visible lag.
+
+---
+
+## GarmentType Enum
+
+```dart
+enum GarmentType { top, bottom, fullBody }
+```
+
+| Value | Anchor point | Width reference | Height reference |
+|---|---|---|---|
+| `top` | Shoulder midpoint | Shoulder width × padding | Shoulder → hip distance |
+| `bottom` | Hip midpoint | Hip width × 1.1 | Torso height × 1.2 |
+| `fullBody` | Shoulder midpoint | Shoulder width × padding | Torso height × 2.2 |
+
+---
+
+## GarmentConfig
+
+`GarmentConfig` tells `GarmentFitter` the garment's pixel dimensions and how it should be scaled relative to the body. All fields are `const`-friendly.
+
+```dart
+class GarmentConfig {
+  final String modelPath;          // Asset or file path to the garment image / .glb
+  final GarmentType type;          // top | bottom | fullBody
+  final double originalWidth;      // Garment image width in pixels
+  final double originalHeight;     // Garment image height in pixels
+
+  /// How much wider than the shoulder span the garment image is.
+  /// jacket ≈ 1.7 (body is ~55% of image width, sleeves fill the rest)
+  /// flat t-shirt ≈ 1.4 (body is ~70% of image width)
+  final double shoulderPadding;    // default 1.4
+
+  /// Where the shoulder seam sits in the garment image — fraction from top.
+  /// jacket: ~0.25 (collar visible above shoulders)
+  /// t-shirt: ~0.12 (minimal collar region at top)
+  final double shoulderLineInImage;// default 0.12
+
+  final double hemExtension;       // Extra length below natural hem, default 0.0
+  final Offset anchorOffset;       // Fine-tune offset, default Offset.zero
+}
+```
+
+---
+
+## Temporal Smoothing Detail
+
+Dimension measurements are smoothed over a 3-frame window in `BodyDimensionEstimator` before they even reach `GarmentFitter`. The weights increase linearly so the most recent frame dominates:
+
+```dart
+// Inside BodyDimensionEstimator._smooth()
+for (int i = 0; i < _history.length; i++) {
+  final weight = (i + 1).toDouble(); // i=0 → weight 1, i=1 → weight 2, i=2 → weight 3
+  totalWeight += weight;
+  shoulderW += _history[i].shoulderWidthPx * weight;
+  torsoH    += _history[i].torsoHeightPx   * weight;
+  // ... hipW, angle, cx, cy
+}
+// Final measurement = weighted sum / totalWeight
+```
+
+`GarmentFitter` then applies a second, lighter EMA (`alpha = 0.20`) on the resulting `GarmentTransform`. The two-stage smoothing — stable dimensions then stable transform — keeps the garment tracking steady even during fast movement.
+
+---
+
+## Complete Usage Example
+
+```dart
+import 'package:lucy_tryon/ar_tryon/fitting/garment_fitter.dart';
+import 'package:lucy_tryon/ar_tryon/core/pipeline_types.dart';
+
+// 1. Define the garment.
+const jacketConfig = GarmentConfig(
+  modelPath: 'assets/images/garment_jacket_dark.png',
+  type: GarmentType.top,
+  originalWidth: 800,
+  originalHeight: 1100,
+  shoulderPadding: 1.5,       // Jacket sleeves add visual width
+  shoulderLineInImage: 0.30,  // Collar takes ~30% of image height
+);
+
+// 2. Create the fitter (typically once, held in TryOnPipeline).
+final fitter = GarmentFitter();
+
+// 3. Each frame: pass the latest pose and viewport size.
+GarmentTransform? transform = fitter.fitGarment(
+  pose: poseResult,
+  config: jacketConfig,
+  viewportWidth: 480,
+  viewportHeight: 640,
+);
+
+// 4. Pass transform to the pipeline / renderer.
+pipeline.setGarment(jacketConfig);
+
+// 5. To swap garments at runtime:
+pipeline.setGarment(GarmentConfig(
+  modelPath: 'assets/images/garment_tshirt_white.png',
+  type: GarmentType.top,
+  originalWidth: 600,
+  originalHeight: 800,
+  shoulderPadding: 1.4,
+  shoulderLineInImage: 0.12,
+));
+```
+
+<Tip>
+Set `shoulderLineInImage` to roughly the fraction of the garment image occupied by the collar and yoke. For a simple crew-neck t-shirt this is about `0.10–0.12`. For a jacket with a tall collar and lapel it is closer to `0.25–0.30`. Getting this value right is the single biggest factor in whether the garment "sits" on the shoulders correctly.
+</Tip>
+
+---
+
+## Mesh-Based Sleeve Deformation
+
+When both elbows are visible in the pose, `GarmentOverlayPainter` upgrades from a rigid flat draw to a 6×9 mesh deformation using Flutter's `Canvas.drawVertices`. The left sleeve columns (u < 0.35) and right sleeve columns (u > 0.65) are displaced toward the detected elbow and wrist positions:
+
+```dart
+// Left sleeve displacement (simplified)
+final elbowDx = leLocal.dx - lsLocal.dx;  // elbow relative to shoulder
+final elbowDy = leLocal.dy - lsLocal.dy;
+final sleeveWeight = (0.35 - u) / 0.35;   // 1.0 at outer edge, 0 at centre
+final sleeveFrac   = depthT.clamp(0.0, 1.0); // 0 at shoulder seam, 1 at hem
+
+px += (elbowDx * sleeveFrac + wristBonus) * sleeveWeight * 0.35;
+py += (elbowDy * sleeveFrac + wristBonusDy) * sleeveWeight * 0.42;
+```
+
+Wrist influence blends in from `depthT = 0.30` onward so the cuff region follows wrist movement. The mesh indices are computed once and cached as a static `Uint16List`, so per-frame GPU cost is only the vertex buffer upload.

@@ -1,0 +1,115 @@
+---
+title: "Managing API Keys and Secrets in Mirror Fit"
+sidebarTitle: "API Keys"
+description: "How to configure Replicate, Decart AI, FASHN, and Hugging Face credentials for Mirror Fit without committing secrets to version control."
+---
+
+Mirror Fit integrates several optional third-party AI services for cloud-based try-on, face swapping, and image generation. None of these services are required for the core on-device AR pipeline, but each needs a credential to function. API keys are passed to the Flutter app via `--dart-define` at build time — this keeps them out of source control, but they are still baked into the compiled binary. The permanent fix (proxying all calls through the Python backend) is the approach already in use for `FASHN_API_KEY` and should eventually be extended to the Replicate and Decart keys too.
+
+## Required Keys
+
+| Service       | Variable Name           | How to Obtain                                          | Used By                                                              |
+| ------------- | ----------------------- | ------------------------------------------------------ | -------------------------------------------------------------------- |
+| Replicate     | `REPLICATE_API_TOKEN`   | [replicate.com](https://replicate.com) → Account → API Tokens | `lib/services/replicate_tryon_service.dart`, `lib/services/face_swap_service.dart` |
+| Decart AI     | `DECART_API_KEY`        | [decart.ai](https://decart.ai) → Dashboard             | `lib/services/decart_tryon_service.dart`                             |
+| FASHN.ai      | `FASHN_API_KEY`         | [fashn.ai](https://fashn.ai) → API Settings            | `face_swap_backend/main.py` (server-side only — never in the Flutter app) |
+| Hugging Face  | `HF_TOKEN`              | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) | `tryon_backend`, `instantid_backend` (Python backends)             |
+
+## Passing Keys at Build Time
+
+Provide Dart-side keys via `--dart-define` flags on the `flutter run` or `flutter build` command. The flags are evaluated at compile time — you must re-run or re-build after changing a value.
+
+**Development:**
+
+```bash
+flutter run \
+  --dart-define=REPLICATE_API_TOKEN=your_token_here \
+  --dart-define=DECART_API_KEY=your_key_here
+```
+
+**Release build (APK):**
+
+```bash
+flutter build apk \
+  --dart-define=REPLICATE_API_TOKEN=your_token_here \
+  --dart-define=DECART_API_KEY=your_key_here
+```
+
+<Note>
+  VS Code users can add `--dart-define` entries to `.vscode/launch.json` under `"toolArgs"` so they apply automatically on every run. Android Studio supports the same via **Run → Edit Configurations → Additional run args**.
+</Note>
+
+## Reading Keys in Dart
+
+Inside the service files, keys are read using `String.fromEnvironment()`. The constant is evaluated at compile time; if no `--dart-define` was provided, `defaultValue` is used (an empty string, which causes the API call to return a 401 rather than crash).
+
+From `lib/services/replicate_tryon_service.dart`:
+
+```dart
+static const _apiToken = String.fromEnvironment(
+  'REPLICATE_API_TOKEN',
+);
+```
+
+From `lib/services/decart_tryon_service.dart`:
+
+```dart
+static const _apiKey = String.fromEnvironment('DECART_API_KEY');
+```
+
+From `lib/services/face_swap_service.dart`:
+
+```dart
+static const _apiToken = String.fromEnvironment('REPLICATE_API_TOKEN');
+```
+
+The pattern is the same across all three files. Add a `defaultValue: ''` parameter if you want a more explicit fallback:
+
+```dart
+static const String _apiToken = String.fromEnvironment(
+  'REPLICATE_API_TOKEN',
+  defaultValue: '',
+);
+```
+
+## Backend Environment Variables
+
+The Python backends (`face_swap_backend`, `tryon_backend`, `instantid_backend`) read credentials from OS environment variables — never from the Flutter app or source code. Set them permanently so they survive a PowerShell restart or shell login:
+
+```powershell
+# Windows — permanent machine-level env vars (run as Administrator):
+[Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_...", "Machine")
+[Environment]::SetEnvironmentVariable("FASHN_API_KEY", "your_key", "Machine")
+
+# Close and reopen PowerShell, then verify:
+[Environment]::GetEnvironmentVariable("HF_TOKEN", "Machine")
+[Environment]::GetEnvironmentVariable("FASHN_API_KEY", "Machine")
+```
+
+```bash
+# Linux / macOS — add to ~/.bashrc, ~/.zshrc, or /etc/environment for permanence:
+export HF_TOKEN=hf_...
+export FASHN_API_KEY=your_key
+```
+
+Once set, the backends pick the values up automatically on the next start via `os.environ.get()`. For example, in `face_swap_backend/main.py`:
+
+```python
+api_key = os.environ.get("FASHN_API_KEY")
+```
+
+## Security Notes
+
+<Warning>
+  **The Replicate API token was previously committed to the public `indwar7/Mirror_Fit` repository** and appears in `lib/services/replicate_tryon_service.dart` and `lib/services/face_swap_service.dart` across both the main repo and the stale `lucy/lib/` copy — six occurrences in total. Treat any token that was live during that period as **compromised**. Rotate it on the [Replicate dashboard](https://replicate.com) before running the app with a new token.
+</Warning>
+
+<Warning>
+  **`--dart-define` keeps secrets out of source control but they are baked into the compiled binary.** Anyone with access to the `.apk` or `.ipa` can extract them with standard reverse-engineering tools. The durable solution is to proxy all Replicate and Decart calls through the backend — the same pattern `FASHN_API_KEY` already uses correctly in `face_swap_backend/main.py` — so the Flutter app never holds a raw credential. This is not yet done for the Replicate and Decart keys.
+</Warning>
+
+<Warning>
+  **The leaked keys remain in git history.** Making the repository private reduces exposure but does not remove the tokens from the commit log. Complete remediation requires a full history rewrite using `git filter-repo` followed by a force-push to all remotes. This is a separate, disruptive operation that has not yet been taken.
+</Warning>
+
+**`FASHN_API_KEY` is already correctly handled.** It is read exclusively from the server environment in `face_swap_backend/main.py` and never passes through the Flutter app. This is the target pattern for all keys in the long term.
