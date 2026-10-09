@@ -1,7 +1,7 @@
 ---
 title: "InstantID Backend: Photo-Realistic Identity Transfer"
 sidebarTitle: "InstantID"
-description: "The Mirror Fit InstantID backend generates photo-realistic face renders with the avatar's identity and the user's live expression using SDXL Lightning 4-step."
+description: "Mirror Fit InstantID backend generates photo-realistic face renders with the avatar's identity and the user's live expression via SDXL Lightning 4-step."
 ---
 
 The InstantID backend (`instantid_backend/server.py`) runs on port **7861** and implements photo-realistic face identity transfer using SDXL Lightning 4-step + InstantID ControlNet + ArcFace identity embeddings. Per WebSocket session, the backend takes one avatar image and computes the avatar's 512-dimensional ArcFace identity embedding **once** at session init. For every subsequent webcam frame from the client, it generates a new face image that carries the avatar's identity but the user's live expression, head pose, eye direction, and lighting. Output is 1024×1024, approximately 95% photo-realistic, at ~1.5–2.0 seconds per frame on a g5.xlarge (A10G). At ~0.6 fps this is suitable for a "photo-real mirror" UX, not for fluid real-time motion.

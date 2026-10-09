@@ -1,5 +1,5 @@
 ---
-title: "Real-Time AR Try-On Pipeline Internals"
+title: "Real-Time AR Try-On Pipeline: Per-Frame Processing"
 sidebarTitle: "AR Pipeline"
 description: "How Mirror Fit's per-frame pipeline processes camera images through pose detection, body segmentation, dimension estimation, and compositing."
 ---
@@ -7,7 +7,7 @@ description: "How Mirror Fit's per-frame pipeline processes camera images throug
 Mirror Fit's AR pipeline runs entirely on-device, processing every camera frame at a target rate of 30 FPS with no cloud calls required. Each frame travels through five sequential stages — camera capture, pose detection, body segmentation, dimension estimation, garment fitting, and compositing — and the result is painted by a `CustomPainter` directly onto the camera preview. The pipeline is orchestrated by `TryOnPipeline extends ChangeNotifier`, which connects all stages and notifies the UI layer when a new `PipelineFrame` is ready.
 
 <Note>
-`google_mlkit_pose_detection` and `tflite_flutter` are currently **commented out** in `pubspec.yaml` because they crash on iOS 26 beta. Both packages are present in the code as stubs that return `null`. To enable the full pipeline on a stable iOS or Android device, uncomment the two lines in `pubspec.yaml`, run `flutter pub get`, and re-enable the real implementations in `pose_detector_service.dart` and `body_segmenter.dart`. The fitting, occlusion, and rendering stages all work without these packages when you supply pose data from an alternative source.
+`google_mlkit_pose_detection: ^0.14.1` and `tflite_flutter: ^0.12.1` are currently **commented out** in `pubspec.yaml` because they crash on iOS 26 beta. Both packages are present in the code as stubs that return `null`. To enable the full pipeline on a stable iOS or Android device, uncomment the two lines in `pubspec.yaml`, run `flutter pub get`, and re-enable the real implementations in `pose_detector_service.dart` and `body_segmenter.dart`. The fitting, occlusion, and rendering stages all work without these packages when you supply pose data from an alternative source.
 </Note>
 
 ---
@@ -151,14 +151,14 @@ The mask is used in two places: by `GarmentOverlayPainter` as a `BlendMode.dstIn
 
 | Measurement | Calculation |
 |---|---|
-| Shoulder width | `distance2D(leftShoulder, rightShoulder)` |
+| Shoulder width | `distanceTo2D(leftShoulder, rightShoulder)` |
 | Torso height | `distance(shoulderCenter, hipCenter)` — or `shoulderWidth × 1.4` if hips not visible |
-| Arm length (left) | `distance2D(leftShoulder, leftElbow) + distance2D(leftElbow, leftWrist)` |
-| Arm length (right) | `distance2D(rightShoulder, rightElbow) + distance2D(rightElbow, rightWrist)` |
-| Hip width | `distance2D(leftHip, rightHip)` — or `shoulderWidth × 0.85` if hips not visible |
+| Arm length (left) | `distanceTo2D(leftShoulder, leftElbow) + distanceTo2D(leftElbow, leftWrist)` |
+| Arm length (right) | `distanceTo2D(rightShoulder, rightElbow) + distanceTo2D(rightElbow, rightWrist)` |
+| Hip width | `distanceTo2D(leftHip, rightHip)` — or `shoulderWidth × 0.85` if hips not visible |
 | Body angle | `atan2(leftShoulder.z − rightShoulder.z, shoulderWidth)`, clamped to ±45° |
 
-**Temporal smoothing:** A 3-entry history buffer applies a linearly weighted average where the most recent frame receives weight 3, the previous frame weight 2, and the oldest frame weight 1. This gives a 5-frame effective window without introducing noticeable lag.
+**Temporal smoothing:** A 3-entry history buffer applies a linearly weighted average where the most recent frame receives weight 3, the previous frame weight 2, and the oldest frame weight 1. This gives a 3-frame effective window without introducing noticeable lag.
 
 ```dart
 // Usage

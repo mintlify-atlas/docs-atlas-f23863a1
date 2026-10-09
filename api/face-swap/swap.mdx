@@ -1,10 +1,10 @@
 ---
-title: "POST /face-swap and POST /fashn/run Endpoints"
-sidebarTitle: "POST /face-swap"
-description: "POST /face-swap swaps a face in an uploaded image. POST /fashn/run proxies try-on to FASHN.ai. Both return JPEG image data."
+title: "POST /face-swap, /fashn/run, and /with-avatar Endpoints"
+sidebarTitle: "Face Swap"
+description: "POST /face-swap swaps faces between two uploaded images. POST /fashn/run proxies try-on to FASHN.ai. POST /face-swap/with-avatar uses a catalogue avatar."
 ---
 
-There are two distinct swap endpoints in this backend. `/face-swap` performs a direct, single-shot face swap using the local InsightFace + inswapper pipeline and returns the result immediately as JPEG bytes. `/fashn/run` is a proxy endpoint for one-shot HD garment try-on via the external FASHN.ai API; it is designed for manager presentations where high output quality matters more than latency. A third endpoint, `/face-swap/with-avatar`, wraps the same local pipeline but resolves the source image from the server's avatar catalogue by ID rather than requiring the caller to upload it.
+There are three distinct swap endpoints in this backend. `/face-swap` performs a direct, single-shot face swap using the local InsightFace + inswapper pipeline and returns the result immediately as JPEG bytes. `/fashn/run` is a proxy endpoint for one-shot HD garment try-on via the external FASHN.ai API; it is designed for manager presentations where high output quality matters more than latency. A third endpoint, `/face-swap/with-avatar`, wraps the same local pipeline but resolves the source image from the server's avatar catalogue by ID rather than requiring the caller to upload it.
 
 ---
 

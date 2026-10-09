@@ -1,7 +1,7 @@
 ---
-title: "GET /health — Live Try-On Backend Health Check"
-sidebarTitle: "GET /health"
-description: "GET /health on the live try-on backend returns the server status and loaded model information before accepting WebSocket connections."
+title: "GET /health — Try-On Backend Liveness and Model Check"
+sidebarTitle: "Health Check"
+description: "GET /health checks whether the try-on backend is running and its diffusion model has finished loading before you open a WebSocket connection."
 ---
 
 The health endpoint is the liveness check for the `tryon_backend` server. Poll it before opening a `/ws/tryon` WebSocket to confirm the diffusion model has finished loading — first startup can take 30–60 seconds as CatVTON weights are read from disk and moved onto the GPU. The endpoint is available at port `8000` (shared with face-swap on the A10G GPU box, or on its own port if deployed separately).
@@ -74,7 +74,7 @@ def _log_gpu(stage: str) -> None:
 
 Log lines look like:
 
-```
+```text
 2026-09-03 12:01:00,123 [INFO] [gpu/before-load] NVIDIA A10G free=18.4GiB of 24.0GiB (torch 2.1.0, cuda 12.1)
 2026-09-03 12:01:38,456 [INFO] [gpu/after-load] NVIDIA A10G free=10.2GiB of 24.0GiB (torch 2.1.0, cuda 12.1)
 2026-09-03 12:01:38,457 [INFO] Model ready.

@@ -1,7 +1,7 @@
 ---
 title: "Android and iOS Platform Configuration for Mirror Fit"
 sidebarTitle: "Platform Config"
-description: "Required permissions, minimum SDK versions, and native configuration for running Mirror Fit on Android and iOS devices."
+description: "Required Android and iOS permissions, minimum SDK versions, and native build configuration for running Mirror Fit on physical devices."
 ---
 
 Mirror Fit relies on three device capabilities that require explicit platform configuration: the **device camera** (live AR feed), **TFLite with the GPU delegate** (body segmentation at 3–5× CPU speed), and **MediaPipe pose detection** via `google_mlkit_pose_detection` (33-landmark skeleton tracking). Each capability requires permissions and minimum OS/SDK versions that differ between Android and iOS. The sections below cover every required change and flag the current iOS 26 compatibility issue that affects the ML packages.

@@ -1,5 +1,5 @@
 ---
-title: "Face Swap Backend: Avatars, Swaps, and Try-On"
+title: "Face Swap Backend: Avatars, Swaps, and Garment Try-On"
 sidebarTitle: "Face Swap"
 description: "The Mirror Fit face-swap FastAPI server: static face swap, live WebSocket swap, avatar management, voice transform, lipsync, and garment try-on."
 ---
@@ -20,7 +20,8 @@ The backend ships a hard-coded catalogue of AI-generated portraits spanning five
 | Kids (girls) | `gen_g_01` – `gen_g_04` | Emma, Priya, Mei-Lin, Amara |
 | Indian — Kids | `gen_ib_01`, `gen_ig_01` | Aarav, Diya |
 | Indian — Teens | `gen_ib_02`, `gen_ig_02` | Vihaan, Ananya |
-| Indian — Adults | `gen_im_01` – `gen_im_03`, `gen_if_01` – `gen_if_03` | Rohan, Rajesh, Dadaji, Isha, Meera, Dadiji |
+| Indian — Adults | `gen_im_01` – `gen_im_02`, `gen_if_01` – `gen_if_02` | Rohan, Rajesh, Isha, Meera |
+| Indian — Elderly | `gen_im_03`, `gen_if_03` | Dadaji, Dadiji |
 | AI / Cartoon | `ai_b_01` – `ai_b_04`, `ai_g_01` – `ai_g_04` | Toby, Riku, Kabir, Marcus, Lily, Sakura, Tara, Nia |
 
 Each preset record carries an `id`, `name`, `category`, `ethnicity`, `gender`, and `voice_ref`. Preset images live in `avatars_cache/{id}.jpg` and are generated offline by `generate_avatars.py`. They cannot be deleted via the API.
@@ -57,7 +58,7 @@ The full live swap pipeline per frame:
 
 ### Live WebSocket Swap (V2)
 
-`/ws/live-swap-v2` uses the Deep-Live-Cam architecture (`swap_v2.py`): `inswapper_128_fp16.onnx` (265 MB) + `GFPGANv1.4.onnx` (325 MB). Both weights are auto-downloaded from HuggingFace on first boot unless `LUCY_AUTO_DOWNLOAD=0` is set. The `/health` endpoint reports whether these weights are present and correctly sized.
+`/ws/live-swap-v2` uses the Deep-Live-Cam architecture (`swap_v2.py`): `inswapper_128_fp16.onnx` (265 MB) + `GFPGANv1.4.onnx` (324 MB). Both weights are auto-downloaded from HuggingFace on first boot unless `LUCY_AUTO_DOWNLOAD=0` is set. The `/health` endpoint reports whether these weights are present and correctly sized.
 
 ### Hair Transfer
 
@@ -71,7 +72,7 @@ Body shape selection is a pure-function lookup in `body_shapes.py` — no I/O, n
 
 | Build | Condition |
 |---|---|
-| `slim` | Chest/bust below lower cutoff (male < 94 cm, female < 86 cm) |
+| `slim` | Chest below lower cutoff **and** waist below plus threshold (male: chest < 94 cm and waist < 100 cm; female: chest < 86 cm and waist < 94 cm) |
 | `average` | Between the two cutoffs |
 | `athletic` | Ordinary girth with pronounced chest-to-waist drop (male ≥ 1.22, female ≥ 1.28) |
 | `plus` | Chest above upper cutoff (male ≥ 108 cm, female ≥ 100 cm) **or** large waist (male ≥ 100 cm, female ≥ 94 cm) |
@@ -149,5 +150,5 @@ Validation checks, each reported separately in the response:
 | `WS` | `/ws/live-swap` | Live face swap V1 (inswapper_128) |
 | `WS` | `/ws/live-swap-v2` | Live face swap V2 (inswapper_128_fp16 + GFPGAN) |
 | `WS` | `/ws/voice-stream` | Real-time audio pitch transform stream |
-| `WS` | `/ws/lipsync` | Wav2Lip audio-driven lip sync stream |
+| `POST` | `/lipsync/generate` | Wav2Lip audio-driven lipsync: accepts audio + avatar_id, returns MP4 bytes |
 | `GET` | `/demo/*` | Serves the static demo UI from `demo/` |

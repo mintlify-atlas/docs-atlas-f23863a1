@@ -13,7 +13,7 @@ Every camera frame that contains a valid pose produces a `GarmentTransform` — 
 ### Tops (`GarmentType.top`)
 
 ```
-shoulderWidth  = distance2D(leftShoulder, rightShoulder)
+shoulderWidth  = distanceTo2D(leftShoulder, rightShoulder)
 garmentWidth   = shoulderWidth × shoulderPadding          (default 1.4)
 scaleX         = garmentWidth / garmentConfig.originalWidth
 
@@ -85,7 +85,7 @@ enum GarmentType { top, bottom, fullBody }
 
 ## GarmentConfig
 
-`GarmentConfig` tells `GarmentFitter` the garment's pixel dimensions and how it should be scaled relative to the body. All fields are `const`-friendly.
+`GarmentConfig` tells `GarmentFitter` the garment's pixel dimensions and how it should be scaled relative to the body. Both `GarmentConfig` and `GarmentType` are defined in `fitting/garment_fitter.dart`. All fields are `const`-friendly.
 
 ```dart
 class GarmentConfig {
@@ -135,7 +135,6 @@ for (int i = 0; i < _history.length; i++) {
 
 ```dart
 import 'package:lucy_tryon/ar_tryon/fitting/garment_fitter.dart';
-import 'package:lucy_tryon/ar_tryon/core/pipeline_types.dart';
 
 // 1. Define the garment.
 const jacketConfig = GarmentConfig(

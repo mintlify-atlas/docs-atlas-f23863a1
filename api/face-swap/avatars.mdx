@@ -1,10 +1,10 @@
 ---
 title: "Avatar Management: Create, List, Stylize, and Delete"
 sidebarTitle: "Avatars"
-description: "REST endpoints for listing preset AI portraits, enrolling user selfies as avatars, assigning body shapes, and managing avatar lifecycle."
+description: "REST endpoints for listing preset AI portraits, enrolling user selfies as avatars, assigning body shapes with measurements, and managing avatar lifecycle."
 ---
 
-The avatar system has two tiers. The first is a fixed catalogue of AI-generated portraits: 10 diverse adults (`gen_f_01`–`gen_f_05` and `gen_m_01`–`gen_m_05`), plus additional kids, teens, Indian, and 3D cartoon avatars — 38 presets in total. These are read-only. The second tier is user-enrolled avatars, created at runtime via `POST /avatars/create`, identified by the `usr_` ID prefix. Every avatar — preset or enrolled — resolves to the same file path convention: `avatars_cache/{id}.jpg`. This means the swap engine, live WebSocket, and try-on pipeline all work with any avatar ID without special-casing.
+The avatar system has two tiers. The first is a fixed catalogue of AI-generated portraits: five female adults (`gen_f_01`–`gen_f_05`), five male adults (`gen_m_01`–`gen_m_05`), plus additional kids, teens, Indian, elderly, and 3D cartoon avatars — 38 presets in total. These are read-only. The second tier is user-enrolled avatars, created at runtime via `POST /avatars/create`, identified by the `usr_` ID prefix. Every avatar — preset or enrolled — resolves to the same file path convention: `avatars_cache/{id}.jpg`. This means the swap engine, live WebSocket, and try-on pipeline all work with any avatar ID without special-casing.
 
 ---
 
@@ -39,7 +39,7 @@ Returns the full avatar catalogue: all presets followed by any avatars enrolled 
     </ResponseField>
     <ResponseField name="has_body" type="boolean">
       Enrolled only. `true` once a body composite has been written via
-      `POST /avatars/{id}/body`.
+      `POST /avatars/\{id\}/body`.
     </ResponseField>
     <ResponseField name="base_body_id" type="string | null">
       Enrolled only. The curated base-body ID used for the composite, e.g.
@@ -93,7 +93,7 @@ curl http://localhost:8000/avatars
 
 ---
 
-## GET /avatars/{avatar_id}/image
+## GET /avatars/\{avatar_id\}/image
 
 Serves the avatar's JPEG image from `avatars_cache/{avatar_id}.jpg`. After a body composite is created, this same path returns the full-body image — the composite overwrites the original portrait in place.
 
@@ -194,7 +194,7 @@ curl -X POST http://localhost:8000/avatars/create \
 
 ---
 
-## POST /avatars/{avatar_id}/stylize
+## POST /avatars/\{avatar_id\}/stylize
 
 Generates a cartoon/anime portrait of an enrolled avatar by forwarding the face image to the InstantID backend running on port 7861. The stylized image is stored as `avatars_cache/{avatar_id}_style.jpg` and recorded in the avatar's metadata. The original photo used for face swapping is not replaced.
 
@@ -212,7 +212,7 @@ Generates a cartoon/anime portrait of an enrolled avatar by forwarding the face 
 <ResponseField name="style" type="string">Style name that was applied.</ResponseField>
 <ResponseField name="style_image_url" type="string">
   Relative URL to retrieve the cartoon image via
-  `GET /avatars/{id}/style-image`.
+  `GET /avatars/\{id\}/style-image`.
 </ResponseField>
 
 **Error codes:**
@@ -232,9 +232,9 @@ curl -X POST http://localhost:8000/avatars/usr_3a7f91bc/stylize \
 
 ---
 
-## GET /avatars/{avatar_id}/style-image
+## GET /avatars/\{avatar_id\}/style-image
 
-Returns the cartoon image previously produced by `POST /avatars/{id}/stylize`.
+Returns the cartoon image previously produced by `POST /avatars/\{id\}/stylize`.
 
 <ParamField path="avatar_id" type="string" required>
   An enrolled avatar ID that has been stylized.
@@ -250,7 +250,7 @@ Returns the cartoon image previously produced by `POST /avatars/{id}/stylize`.
 
 ---
 
-## POST /avatars/{avatar_id}/body
+## POST /avatars/\{avatar_id\}/body
 
 Assigns body measurements to an enrolled avatar and creates a full-body composite: the server selects a curated base-body photograph that matches the gender and build bin, runs a face swap to place the enrolled face onto that photograph, and writes the result back over `avatars_cache/{avatar_id}.jpg`. All downstream endpoints (swap, try-on, live WebSocket) then automatically use the full-body image.
 
@@ -264,9 +264,8 @@ Assigns body measurements to an enrolled avatar and creates a full-body composit
 </ParamField>
 
 <ParamField body="height_cm" type="number">
-  Height in centimetres. Plausible range: 100–230 cm. Optional — has no
-  effect on body-shape bin selection in the current logic but is recorded
-  for reference.
+  Height in centimetres. Plausible range: 100–230 cm. Optional — recorded
+  for reference but does not affect build-bin selection in the current logic.
 </ParamField>
 
 <ParamField body="chest_cm" type="number">
@@ -340,7 +339,7 @@ Assigns body measurements to an enrolled avatar and creates a full-body composit
 
 ---
 
-## DELETE /avatars/{avatar_id}
+## DELETE /avatars/\{avatar_id\}
 
 Removes an enrolled avatar and its image files from disk. Preset avatars (`gen_*`, `ai_*`) cannot be deleted and return `403`.
 
@@ -365,7 +364,7 @@ Removes an enrolled avatar and its image files from disk. Preset avatars (`gen_*
 
 ## Body Shape Assignment
 
-When `POST /avatars/{id}/body` is called, the `chest_cm` and `waist_cm` measurements are used together to select one of four build bins per gender. Supplying only one of the two, or neither, causes the selection to fall back to `average`.
+When `POST /avatars/\{id\}/body` is called, the `chest_cm` and `waist_cm` measurements are used together to select one of four build bins per gender. Supplying only one of the two, or neither, causes the selection to fall back to `average`.
 
 **Female cutoffs** (chest/bust in cm):
 
@@ -401,7 +400,7 @@ Use `GET /base-bodies` to check which bins have an approved photograph on this d
 curl http://localhost:8000/base-bodies
 ```
 
-If a bin is missing its photograph, `POST /avatars/{id}/body` returns `501` naming the missing `base_body_id` rather than silently substituting a neighbouring build.
+If a bin is missing its photograph, `POST /avatars/\{id\}/body` returns `501` naming the missing `base_body_id` rather than silently substituting a neighbouring build.
 
 ---
 

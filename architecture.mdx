@@ -1,5 +1,5 @@
 ---
-title: "Mirror Fit System Architecture and Data Flow"
+title: "Mirror Fit Architecture: Pipeline, Backends, and Data Flow"
 sidebarTitle: "Architecture"
 description: "How Mirror Fit's camera pipeline, AR overlay, AI backends, fit scoring, and returns-risk analysis connect into a single end-to-end system."
 ---
@@ -189,9 +189,11 @@ Product Detail Screen (Flutter)
   <Card title="Flutter On-Device Layer" icon="mobile">
     **Framework:** Flutter `sdk: ^3.10.1` (Dart)
 
-    **Pose:** `google_mlkit_pose_detection` (MediaPipe, 33 landmarks)
+    **Camera:** `camera ^0.12.0+1` (30 FPS stream)
 
-    **Segmentation:** `tflite_flutter` (TFLite GPU delegate, 256×256)
+    **Pose:** `google_mlkit_pose_detection ^0.14.1` *(currently disabled — crashes on iOS 26)*
+
+    **Segmentation:** `tflite_flutter ^0.12.1` *(currently disabled — crashes on iOS 26)*
 
     **3D viewer:** `model_viewer_plus ^1.8.1` (`.glb` / `.gltf`)
 
@@ -233,8 +235,8 @@ Product Detail Screen (Flutter)
 |---|---|---|
 | Mobile app | Flutter / Dart | Cross-platform UI, camera, AR rendering |
 | Camera service | `camera ^0.12.0+1` | 30 FPS stream, YUV420 / BGRA8888 |
-| Pose detection | MLKit / MediaPipe | 33 skeletal landmarks per frame |
-| Body segmentation | TFLite + GPU delegate | Per-pixel body mask, ~10 ms/frame |
+| Pose detection | `google_mlkit_pose_detection ^0.14.1` *(disabled — iOS 26 crash)* | 33 skeletal landmarks per frame |
+| Body segmentation | `tflite_flutter ^0.12.1` *(disabled — iOS 26 crash)* | Per-pixel body mask, ~10 ms/frame |
 | Garment fitting | Pure Dart | Anchor, scale, rotate, perspective |
 | Occlusion | `CustomPainter` + z-depth | Arm-over-garment depth ordering |
 | 3D model viewer | `model_viewer_plus` | AR Quick Look / Scene Viewer for `.glb` |

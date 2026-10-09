@@ -1,7 +1,7 @@
 ---
-title: "POST /avatars/{avatar_id}/tryon — Garment Try-On"
-sidebarTitle: "POST /tryon"
-description: "POST /avatars/{avatar_id}/tryon runs CatVTON garment try-on on a specific avatar, returning a composited image with the garment applied."
+title: "Garment Try-On, Lip Sync, and Voice Transform Endpoints"
+sidebarTitle: "Try-On"
+description: "POST /avatars/:id/tryon applies a garment to an avatar. Also covers POST /lipsync/generate for lip-sync video and POST /voice/transform for audio pitch-shift."
 ---
 
 The try-on endpoint runs the full VTON pipeline against a named avatar: human parse → DensePose → cloth-agnostic mask → CatVTON (or IDM-VTON) inference → hard paste-back. The hard paste-back is the critical step — every pixel outside the garment mask is copied verbatim from the input avatar image rather than regenerated, which means the avatar's face and identity are arithmetically preserved, not merely "probably" preserved. The pipeline asserts this before returning.
@@ -10,9 +10,9 @@ The same page also covers two related media-generation endpoints: `POST /lipsync
 
 ---
 
-## POST /avatars/{avatar_id}/tryon
+## POST /avatars/\{avatar_id\}/tryon
 
-Applies a garment image to an avatar. Requires a full-body avatar (assign one first via `POST /avatars/{id}/body`). The try-on pipeline is loaded lazily on the first call; expect 30–60 seconds of additional latency on that first request while models are loaded into GPU memory.
+Applies a garment image to an avatar. Requires a full-body avatar (assign one first via `POST /avatars/\{id\}/body`). The try-on pipeline is loaded lazily on the first call; expect 30–60 seconds of additional latency on that first request while models are loaded into GPU memory.
 
 <ParamField path="avatar_id" type="string" required>
   The avatar ID from `GET /avatars`. Works with both preset and enrolled

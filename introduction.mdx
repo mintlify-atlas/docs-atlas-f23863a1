@@ -28,12 +28,14 @@ Mirror Fit is built entirely on open-source tooling. No vendor lock-in, no meter
 | Layer | Technology | Role |
 |---|---|---|
 | **Mobile framework** | Flutter / Dart (`sdk: ^3.10.1`) | Cross-platform app, camera stream, rendering |
-| **Pose detection** | Google MLKit / MediaPipe | 33-landmark skeleton at 30 FPS |
-| **Body segmentation** | TensorFlow Lite (GPU delegate) | Selfie mask for occlusion at 256×256 |
+| **Camera stream** | `camera ^0.12.0+1` | Real-time 30 FPS frame capture for the AR pipeline |
+| **Pose detection** | `google_mlkit_pose_detection ^0.14.1` *(disabled — crashes on iOS 26)* | 33-landmark skeleton at 30 FPS |
+| **Body segmentation** | `tflite_flutter ^0.12.1` *(disabled — crashes on iOS 26)* | Selfie mask for occlusion at 256×256 |
+| **WebRTC streaming** | `flutter_inappwebview ^6.1.5` | WebRTC camera streaming via WebView (Decart realtime) |
 | **Face swap** | InsightFace | Photorealistic face transfer for avatar generation |
 | **Garment diffusion** | CatVTON (via `tryon_backend`) | Diffusion-model garment overlay for high-realism previews |
 | **Backend framework** | FastAPI + uvicorn | Python GPU backends over HTTP and WebSocket |
-| **State management** | Provider (`^6.1.2`) | Reactive state across screens |
+| **State management** | `provider ^6.1.2` | Reactive state across screens |
 | **3D model viewer** | `model_viewer_plus ^1.8.1` | `.glb` garment preview with pan/zoom/AR Quick Look |
 
 ## Why Open Source?
@@ -41,7 +43,7 @@ Mirror Fit is built entirely on open-source tooling. No vendor lock-in, no meter
 Mirror Fit operates on a strict **zero paid APIs** principle: every model weight is either downloaded from Hugging Face or bundled in `assets/ml_models/`, every GPU workload runs on a self-hosted machine, and the codebase is MIT-licensed.
 
 - **Self-hosted GPU backends** — The face-swap, try-on, live-portrait, and AI-twin services each run as an isolated FastAPI process on a single NVIDIA GPU box. `start_all.ps1` starts only the services that are down, leaving active sessions untouched.
-- **On-device ML** — Pose detection (MLKit) and body segmentation (TFLite with GPU delegate) run locally on the phone. All per-frame math is pure Dart — no network calls in the hot path.
+- **On-device ML** — The AR pipeline is architected for on-device pose detection (MLKit) and body segmentation (TFLite with GPU delegate); both packages are currently disabled pending an iOS 26 compatibility fix. All per-frame fitting math is pure Dart — no network calls in the hot path.
 - **MIT license** — Fork it, extend it, ship it. The full pipeline — from `pipeline_types.dart` to the Python diffusion server — is available without restriction.
 
 ## Project Components

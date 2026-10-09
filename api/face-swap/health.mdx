@@ -1,7 +1,7 @@
 ---
-title: "GET /health — Face Swap Backend Health Check"
-sidebarTitle: "GET /health"
-description: "GET /health returns a JSON status object confirming the face-swap backend is running and its loaded models are ready."
+title: "GET /health — LUCY AI Backend Status and Model Check"
+sidebarTitle: "Health Check"
+description: "GET /health returns a JSON status object confirming the face-swap backend is running, models are loaded, and optional weights are present."
 ---
 
 The `/health` endpoint is the liveness check for the LUCY AI face-swap backend running on port 8000. Call it before sending any swap or avatar requests to confirm that the server has started successfully and that its ONNX models are loaded and available. It reports each optional engine and weight file individually, so a missing model file is one `curl` away from being diagnosed rather than requiring a full test swap to discover.

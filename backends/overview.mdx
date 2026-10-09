@@ -1,7 +1,7 @@
 ---
-title: "Backend Services Overview and Architecture"
+title: "Mirror Fit Backend Services: Architecture Overview"
 sidebarTitle: "Overview"
-description: "Mirror Fit's three self-hosted GPU backends: face-swap (port 7860), live try-on (WebSocket diffusion, port 8000), and InstantID identity transfer (port 7861)."
+description: "Mirror Fit's three GPU backends: face-swap (7860), live try-on WebSocket diffusion (8000), and InstantID photo-real identity transfer (7861)."
 ---
 
 Mirror Fit ships three independent FastAPI backends, each serving a distinct AI function. All three run on a single shared GPU — the project targets an AWS g5.xlarge instance with an NVIDIA A10G (24 GB VRAM). The face-swap backend handles avatar management, static and live face swaps, voice transform, lipsync, and garment try-on proxying. The live try-on backend streams diffusion-based garment generations over WebSocket. The InstantID backend generates photo-realistic face renders that transfer an avatar's identity onto a user's live webcam expression.
@@ -26,7 +26,11 @@ Mirror Fit ships three independent FastAPI backends, each serving a distinct AI 
 
 ## Shared GPU Architecture
 
-All three backends share a single NVIDIA A10G GPU with 24 GB of VRAM. Because the A10G is shared, loading all three simultaneously constrains per-backend VRAM headroom. The `start_all.ps1` script at the project root manages the process lifecycle — it starts each backend in a separate hidden process, redirects stdout/stderr to `C:\logs\<name>.log` and `C:\logs\<name>.err.log`, and only starts a backend if its port is not already bound (safe to re-run; use `-Force` to restart a running backend).
+All three backends share a single NVIDIA A10G GPU with 24 GB of VRAM. Because the A10G is shared, loading all three simultaneously constrains per-backend VRAM headroom. The `start_all.ps1` script at the project root manages the face-swap (7860), live-portrait (7862), live try-on (8000), and AI-twin (7863) process lifecycle — it starts each backend in a separate hidden process, redirects stdout/stderr to `C:\\logs\\<name>.log` and `C:\\logs\\<name>.err.log`, and only starts a backend if its port is not already bound (safe to re-run; use `-Force` to restart a running backend).
+
+<Note>
+  The **InstantID backend (port 7861)** is **not** managed by `start_all.ps1`. It must be started separately using `instantid_backend/start.ps1` after running `instantid_backend/setup.ps1` once. See [InstantID](/backends/instantid) for the full setup procedure.
+</Note>
 
 The tryon backend calls `_log_gpu()` at load time to record available VRAM so that allocation failures (which would otherwise produce a silent exit with no traceback) are diagnosed from the log. Refer to [PROGRESS.md](https://github.com/indwar7/Mirror_Fit/blob/main/PROGRESS.md) for observed VRAM behaviour — when face-swap and live-portrait are already resident, the tryon backend's model load happens against reduced headroom.
 
@@ -75,7 +79,11 @@ Each backend exposes a `GET /health` endpoint that returns a JSON object describ
     ```bash
     curl http://localhost:8000/health
     ```
-    Returns `{"status": "ok"}` when the server process is up. Model load is lazy — the model loads on the first WebSocket connection.
+    Returns:
+    ```json
+    { "status": "ok", "model_loaded": true }
+    ```
+    `model_loaded` is `true` once the model finishes loading at server startup. The try-on model loads eagerly at startup (not lazily on first connection).
   </Tab>
   <Tab title="InstantID (7861)">
     ```bash

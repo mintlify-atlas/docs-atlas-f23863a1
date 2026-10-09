@@ -1,5 +1,5 @@
 ---
-title: "3D Garment Rendering: model_viewer_plus and Unity"
+title: "3D Garment Rendering: model_viewer_plus and Unity Bridge"
 sidebarTitle: "3D Rendering"
 description: "Loading and rendering .glb garment models in Mirror Fit using model_viewer_plus for simple overlay and flutter_unity_widget for full 3D compositing."
 ---
@@ -138,10 +138,12 @@ class _ARWithUnityScreenState extends State<ARWithUnityScreen> {
 
 ```dart
 // Called each frame from the pose pipeline result.
+// x and y are raw pixel coordinates; Unity converts to world space
+// using Camera.main.ScreenToWorldPoint(new Vector3(x, y, depth)).
 _bridge?.updateGarmentTransform(
   modelPath: 'tshirt.glb',
-  x: transform.x / viewportWidth,     // Normalised 0–1
-  y: transform.y / viewportHeight,
+  x: transform.x,
+  y: transform.y,
   scaleX: transform.scaleX,
   scaleY: transform.scaleY,
   rotationY: transform.rotationDegrees,
@@ -173,10 +175,6 @@ All communication between Flutter and Unity is JSON encoded as strings.
     "position": { "x": 0.5, "y": 0.3, "z": 0 },
     "rotation": { "x": 0, "y": 15, "z": 0 },
     "scale":    { "x": 1.2, "y": 1.1, "z": 1.0 }
-  },
-  "landmarks": {
-    "left_shoulder":  { "x": 0.3, "y": 0.25, "z": 0 },
-    "right_shoulder": { "x": 0.7, "y": 0.24, "z": 0 }
   }
 }
 ```
@@ -192,7 +190,6 @@ All communication between Flutter and Unity is JSON encoded as strings.
 ```json
 {
   "type": "render_complete",
-  "frame_id": 42,
   "render_time_ms": 8
 }
 ```
@@ -234,7 +231,7 @@ class UnityBridgeController {
 }
 ```
 
-Messages are sent to a Unity `GameObject` named `"GarmentController"`, calling its `"OnFlutterMessage"` method. The `unity_bridge.dart` file contains a complete, ready-to-use `GarmentController.cs` Unity C# script as a doc comment — copy it into your Unity project's `Assets/Scripts/` directory. The script uses `JsonUtility.FromJson<GarmentMessage>()` to parse incoming messages and calls `Camera.main.ScreenToWorldPoint()` to convert the 2D normalised position into a 3D world coordinate.
+Messages are sent to a Unity `GameObject` named `"GarmentController"`, calling its `"OnFlutterMessage"` method. The `unity_bridge.dart` file contains a complete, ready-to-use `GarmentController.cs` Unity C# script as a doc comment — copy it into your Unity project's `Assets/Scripts/` directory. The script uses `JsonUtility.FromJson<GarmentMessage>()` to parse incoming messages and calls `Camera.main.ScreenToWorldPoint()` to convert the 2D pixel position into a 3D world coordinate.
 
 <Tip>
 `model_viewer_plus` is strongly recommended for getting started — you can see your `.glb` garment on screen in under an hour with no native toolchain changes. Switch to `flutter_unity_widget` once you have confirmed your garment assets look correct and you need cloth shaders or physics simulation.

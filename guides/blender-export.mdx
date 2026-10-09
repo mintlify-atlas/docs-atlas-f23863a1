@@ -1,7 +1,7 @@
 ---
-title: "Export Garment Models from Blender for Mirror Fit"
+title: "Export 3D Garment Models from Blender for Mirror Fit"
 sidebarTitle: "Blender Export"
-description: "Prepare and export 3D garment meshes from Blender as optimised .glb files for Mirror Fit's real-time AR try-on pipeline."
+description: "Prepare and export optimised 3D garment meshes from Blender as .glb files ready for Mirror Fit's real-time mobile AR try-on pipeline."
 ---
 
 Mirror Fit loads `.glb` (glTF Binary) garment models at runtime and overlays them on the live camera feed. Because the app targets mid-range Android devices running at 30 FPS, every model must be optimised for mobile: **under 50,000 polygons** and ideally **under 2 MB** on disk. The sections below walk through model preparation, the exact Blender export settings, and where to place the finished files inside the project.

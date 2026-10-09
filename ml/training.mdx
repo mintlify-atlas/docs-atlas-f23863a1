@@ -1,7 +1,7 @@
 ---
-title: "Training the Fit and Returns Models"
+title: "Training Mirror Fit: Fit Score and Returns-Risk Models"
 sidebarTitle: "Training"
-description: "How to retrain Mirror Fit's fit scoring and returns-risk models on new data, including dataset format, train/val/test splits, and export to JSON for browser inference."
+description: "How to retrain Mirror Fit's fit scoring and returns-risk models, covering dataset format, train/val/test splits, and JSON export for browser inference."
 ---
 
 Mirror Fit ships two ML models: the **Fit Scoring Engine** (`fit_score`) and the **Returns-Risk Classifier** (`returns_risk`). Both are logistic regression pipelines trained with scikit-learn, chosen for their naturally calibrated probabilities, inspectable coefficients, and compact JSON export. Both export to a small JSON file that the browser loads directly — there is no server needed for inference, and the browser reproduces scikit-learn's predictions exactly.

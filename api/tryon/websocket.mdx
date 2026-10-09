@@ -1,6 +1,6 @@
 ---
-title: "WS /ws/tryon — Live Diffusion Try-On WebSocket"
-sidebarTitle: "WS /ws/tryon"
+title: "WS /ws/tryon — Live Diffusion Try-On WebSocket Endpoint"
+sidebarTitle: "Try-On WebSocket"
 description: "WS /ws/tryon streams real-time diffusion-based garment try-on: send a camera frame and garment image, receive a composited JPEG output frame."
 ---
 
@@ -8,7 +8,7 @@ The `/ws/tryon` WebSocket endpoint drives the live virtual try-on experience in 
 
 ## Connection
 
-```
+```text
 ws://SERVER_HOST:8000/ws/tryon
 ```
 
@@ -157,7 +157,7 @@ All messages are UTF-8 JSON text frames. The client sends typed request messages
 
 The server uses temporal blending to smooth the output between successive diffusion generations. After each inference pass the new result is blended with the previous output using a fixed `alpha_new` weight:
 
-```
+```text
 blended = alpha_new × new_result + (1 − alpha_new) × previous_result
 ```
 
@@ -186,7 +186,7 @@ Only one diffusion inference runs at a time per WebSocket connection. If a new `
 
 The server logs per-frame latency at `INFO` level:
 
-```
+```text
 [lat] decode=18ms infer=2741ms encode=31ms total=2790ms fps=0.36
 ```
 
@@ -197,7 +197,7 @@ Two threads are allocated to the worker pool — one for GPU inference and one f
 The following issues are confirmed from live testing (as of 2026-09-03) and are not yet fixed:
 
 1. **DWPose pose conditioning is disabled.** At startup the model logs:
-   ```
+   ```text
    DWPose failed to load, running without pose conditioning:
    module 'mediapipe' has no attribute 'solutions'
    ```
@@ -261,11 +261,9 @@ Future<void> _initBackendThenStart() async {
 // 4. On "result" response, set <img>.src and fade it in
 
 ws.onopen = async () => {
+  setStatus('Sending garment…');
   const garmentB64 = await urlToBase64(GARMENT_URL);
-  ws.send(JSON.stringify({
-    type:          'init',
-    garment_image: garmentB64,
-  }));
+  ws.send(JSON.stringify({ type: 'init', garment_image: garmentB64 }));
 };
 
 ws.onmessage = (e) => {

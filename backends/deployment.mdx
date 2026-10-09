@@ -1,10 +1,10 @@
 ---
-title: "Deploying Mirror Fit Backends on a GPU Server"
+title: "Deploying Mirror Fit Backends on a Windows GPU Server"
 sidebarTitle: "Deployment"
-description: "How to deploy Mirror Fit's three AI backends on a Windows GPU instance (AWS g5.xlarge A10G) with conda environments, process management, and log monitoring."
+description: "Deploy Mirror Fit's AI backends on a Windows GPU instance (AWS g5.xlarge A10G) using conda envs, start_all.ps1 process management, and log monitoring."
 ---
 
-Mirror Fit targets an AWS **g5.xlarge** instance running Windows Server with an NVIDIA A10G GPU (24 GB VRAM). All three backends — face-swap, live try-on, and InstantID — share this single GPU. The `start_all.ps1` script at the project root manages the full process lifecycle: it checks which ports are already bound, starts only the backends that are down, creates Windows Firewall inbound rules automatically, and waits up to 120 seconds for model loads before reporting status. The deploy workflow in `.github/workflows/deploy.yml` calls `start_all.ps1 -Force` on every push to `main` via a self-hosted runner on the GPU box.
+Mirror Fit targets an AWS **g5.xlarge** instance running Windows Server with an NVIDIA A10G GPU (24 GB VRAM). The face-swap, live try-on, live-portrait, and AI-twin backends share this single GPU. The `start_all.ps1` script at the project root manages those four backends: it checks which ports are already bound, starts only the backends that are down, creates Windows Firewall inbound rules automatically, and waits up to 120 seconds for model loads before reporting status. The deploy workflow in `.github/workflows/deploy.yml` calls `start_all.ps1 -Force` on every push to `main` via a self-hosted runner on the GPU box. The InstantID backend (port 7861) is managed separately — see [InstantID](/backends/instantid).
 
 ## Server Requirements
 
@@ -104,6 +104,16 @@ The script checks each service in this order:
 <Note>
   Three Flutter tabs — **AR Avatar**, **Fit Analyser**, and **Returns Guard** — require no backend at all. They run entirely in the browser/Flutter app.
 </Note>
+
+<Warning>
+  The **InstantID backend (port 7861)** is **not** in the table above and is **not** managed by `start_all.ps1`. It must be set up and started separately:
+  ```powershell
+  cd C:\virtual-try-on\instantid_backend
+  powershell .\setup.ps1   # one-time (~12 GB download)
+  powershell .\start.ps1   # starts the server on port 7861
+  ```
+  See [InstantID](/backends/instantid) for the full setup guide.
+</Warning>
 
 ## Environment Variables
 

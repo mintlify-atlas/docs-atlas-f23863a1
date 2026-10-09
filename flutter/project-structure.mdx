@@ -1,10 +1,10 @@
 ---
-title: "Flutter App Structure and Module Overview"
+title: "Mirror Fit Flutter App: Structure and Module Overview"
 sidebarTitle: "Project Structure"
-description: "How the Mirror Fit Flutter app is organised: screens, services, models, and the AR try-on pipeline modules under lib/ar_tryon/."
+description: "How the Mirror Fit Flutter app is organised: screens, services, models, and the real-time AR try-on pipeline modules under lib/ar_tryon/."
 ---
 
-Mirror Fit is structured in two distinct layers. The first is the original product-browsing shell — screens, services, widgets, and models — that handles the catalogue, photo upload try-on flow, and UI chrome. The second, newer layer lives entirely under `lib/ar_tryon/` and implements the real-time on-device AR pipeline: camera streaming, pose detection, body segmentation, garment fitting, occlusion, and rendering. The two layers communicate through the shared `TryOnPipeline` class and the `GarmentConfig` / `GarmentTransform` types defined in `pipeline_types.dart`. All ML processing runs on-device with no cloud calls required.
+Mirror Fit is structured in two distinct layers. The first is the original product-browsing shell — screens, services, widgets, and models — that handles the catalogue, photo upload try-on flow, and UI chrome. The second, newer layer lives entirely under `lib/ar_tryon/` and implements the real-time on-device AR pipeline: camera streaming, pose detection, body segmentation, garment fitting, occlusion, and rendering. The two layers communicate through the shared `TryOnPipeline` class and the `GarmentConfig` / `GarmentTransform` types. All ML processing runs on-device with no cloud calls required.
 
 ## Directory Tree
 
@@ -20,7 +20,8 @@ lib/
 └── ar_tryon/                          # === NEW: Real-Time AR Pipeline ===
     ├── core/
     │   ├── pipeline_types.dart        # All shared types: Landmark, PoseResult,
-    │   │                              #   BodyDimensions, GarmentTransform, etc.
+    │   │                              #   BodyDimensions, GarmentTransform,
+    │   │                              #   SegmentationMask, RenderLayer, PipelineFrame
     │   ├── tryon_pipeline.dart        # Main orchestrator — connects all stages
     │   └── performance_optimizer.dart # Adaptive quality, FPS monitoring
     ├── camera/
@@ -29,24 +30,31 @@ lib/
     │   └── pose_detector_service.dart # MLKit pose detection (33 landmarks),
     │                                  #   temporal smoothing, frame dropping
     ├── segmentation/
-    │   └── body_segmenter.dart        # TFLite selfie segmentation (256x256),
+    │   └── body_segmenter.dart        # TFLite selfie segmentation (256×256),
     │                                  #   GPU delegate, body part extraction
     ├── body/
     │   └── body_dimension_estimator.dart # Shoulder width, torso height, arm length,
     │                                    #   hip width, body angle from landmarks
     ├── fitting/
-    │   └── garment_fitter.dart        # Garment-to-body mapping
+    │   └── garment_fitter.dart        # GarmentFitter, GarmentConfig, GarmentType
+    │                                  #   — garment-to-body mapping
     ├── occlusion/
     │   └── occlusion_handler.dart     # Arm-over-clothing detection via z-depth
+    ├── compositing/
+    │   └── photo_compositor.dart      # Still-photo compositing (capture mode)
     ├── rendering/
     │   ├── garment_renderer.dart      # CustomPainter for 2D garment overlay + skeleton
     │   └── model_loader.dart          # .glb file loading + Blender export guide
     ├── unity_bridge/
     │   └── unity_bridge.dart          # Flutter↔Unity JSON message passing +
     │                                  #   complete C# GarmentController script
+    ├── services/
+    │   └── virtual_tryon_service.dart # Service wrapper used by the AR screen
     ├── screens/
     │   ├── ar_tryon_screen.dart       # Main AR screen: camera + overlays + controls
-    │   └── model_preview_screen.dart  # 3D model viewer (model_viewer_plus)
+    │   ├── model_preview_screen.dart  # 3D model viewer (model_viewer_plus)
+    │   ├── tryon_photo_screen.dart    # Still-photo try-on flow
+    │   └── tryon_result_screen.dart   # Result / share screen
     └── widgets/
         ├── pose_skeleton_painter.dart # Skeleton visualization (joints + bones)
         ├── debug_overlay.dart         # FPS, processing time, body metrics
@@ -84,7 +92,7 @@ Reusable widgets for the product browsing UI: `ClothCard`, `PhotoUpload`, and su
 <Accordion title="core/ — Pipeline orchestration and shared types">
 | File | Role |
 |------|------|
-| `pipeline_types.dart` | Defines every type shared between pipeline stages: `Landmark`, `LandmarkType`, `PoseResult`, `BodyDimensions`, `GarmentTransform`, `GarmentConfig`, `GarmentType`, `SegmentationMask`, `RenderLayer`, `PipelineFrame` |
+| `pipeline_types.dart` | Defines every type shared between pipeline stages: `Landmark`, `LandmarkType`, `PoseResult`, `BodyDimensions`, `GarmentTransform`, `SegmentationMask`, `RenderLayer`, `PipelineFrame` |
 | `tryon_pipeline.dart` | `TryOnPipeline extends ChangeNotifier` — the main orchestrator. Exposes `initialize()`, `start()`, `stop()`, `setGarment(GarmentConfig)`, `setViewport()`, and state getters (`currentFrame`, `currentPose`, `fps`). |
 | `performance_optimizer.dart` | `PerformanceMonitor` tracks a 30-frame sliding window, computes average FPS, and returns `QualitySettings` (enableSegmentation, enableOcclusion, poseModelAccurate, inputResolution) for the current quality level. |
 </Accordion>
@@ -116,13 +124,19 @@ Reusable widgets for the product browsing UI: `ClothCard`, `PhotoUpload`, and su
 <Accordion title="fitting/ — Garment-to-body mapping">
 | File | Role |
 |------|------|
-| `garment_fitter.dart` | `GarmentFitter` takes a `PoseResult` + `GarmentConfig` and returns a `GarmentTransform` (x, y, scaleX, scaleY, rotationDegrees). Anchors the shoulder seam of the garment image to the detected shoulder midpoint. Applies light EMA smoothing (`_smoothAlpha = 0.20`) on top of landmark-level One-Euro filtering. |
+| `garment_fitter.dart` | `GarmentFitter` takes a `PoseResult` + `GarmentConfig` and returns a `GarmentTransform` (x, y, scaleX, scaleY, rotationDegrees). Anchors the shoulder seam of the garment image to the detected shoulder midpoint. Applies light EMA smoothing (`_smoothAlpha = 0.20`) on top of landmark-level One-Euro filtering. Also defines `GarmentConfig` and `GarmentType`. |
 </Accordion>
 
 <Accordion title="occlusion/ — Arm occlusion handling">
 | File | Role |
 |------|------|
 | `occlusion_handler.dart` | Detects when arms are in front of the torso using z-depth comparison. Generates an occlusion mask (255 where arms should render over garment) using the segmentation mask and a 35 px arm-radius capsule path. Returns sorted `RenderLayer` list for painter's-algorithm compositing. |
+</Accordion>
+
+<Accordion title="compositing/ — Photo compositing">
+| File | Role |
+|------|------|
+| `photo_compositor.dart` | Handles still-photo capture mode: composites the current garment overlay onto a high-resolution camera snapshot for saving and sharing. |
 </Accordion>
 
 <Accordion title="rendering/ — Garment overlay and model loading">
@@ -143,6 +157,8 @@ Reusable widgets for the product browsing UI: `ClothCard`, `PhotoUpload`, and su
 |------|------|
 | `ar_tryon_screen.dart` | `ARTryOnScreen` — the main camera + overlay screen. Initialises `TryOnPipeline`, loads the garment image, stacks `CameraPreview` + `GarmentOverlayPainter` inside a `FittedBox`, shows a tracking status pill, and wires up the capture button for photo compositing. |
 | `model_preview_screen.dart` | 3D model viewer using `model_viewer_plus`. Used for static product preview separate from live AR. |
+| `tryon_photo_screen.dart` | Still-photo try-on screen — user selects a photo and sees the garment composited over it. |
+| `tryon_result_screen.dart` | Result screen showing the composited try-on output with share/save actions. |
 | `pose_skeleton_painter.dart` | Debug overlay drawing bones and joint circles from `PoseResult`. |
 | `debug_overlay.dart` | Shows live FPS, per-stage processing times, and body metric values. |
 | `garment_selector_bar.dart` | Horizontal scrolling garment picker at the bottom of the AR screen. |
@@ -209,7 +225,42 @@ class GarmentTransform {
   final double shoulderLineInImage; // Fraction from top where shoulder seam sits
 }
 
-/// Configuration for a garment item — passed to the pipeline.
+/// Binary segmentation mask — one byte per pixel.
+class SegmentationMask {
+  final Uint8List data; // width × height bytes
+  final int width;      // 256
+  final int height;     // 256
+
+  int valueAt(int x, int y);
+  bool isForeground(int x, int y, {int threshold = 128});
+}
+
+/// A compositing layer for the occlusion pipeline.
+class RenderLayer {
+  final BodyPart? bodyPart;
+  final bool isGarment;
+  final double depth;
+  final Rect bounds;
+}
+
+/// Full pipeline result for one frame — passed to the renderer.
+class PipelineFrame {
+  final PoseResult pose;
+  final BodyDimensions dimensions;
+  final GarmentTransform? garmentTransform;
+  final int processingTimeMs;
+  final SegmentationMask? segmentationMask;
+  final int maskAgeFrames; // 0 = this frame, 999 = never produced
+}
+```
+
+## Garment Types from `garment_fitter.dart`
+
+`GarmentConfig` and `GarmentType` are defined in `fitting/garment_fitter.dart` alongside `GarmentFitter`, since they are tightly coupled to the fitting algorithm.
+
+```dart
+enum GarmentType { top, bottom, fullBody }
+
 class GarmentConfig {
   final String modelPath;
   final GarmentType type;          // top | bottom | fullBody
@@ -217,9 +268,7 @@ class GarmentConfig {
   final double originalHeight;
   final double shoulderPadding;    // default 1.4
   final double shoulderLineInImage;// default 0.12
-  final double hemExtension;
-  final Offset anchorOffset;
+  final double hemExtension;       // default 0.0
+  final Offset anchorOffset;       // default Offset.zero
 }
-
-enum GarmentType { top, bottom, fullBody }
 ```

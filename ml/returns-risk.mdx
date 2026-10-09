@@ -1,7 +1,7 @@
 ---
 title: "Returns-Risk Classifier: Cost-Sensitive Fraud Triage"
 sidebarTitle: "Returns Risk"
-description: "How Mirror Fit's returns-risk model flags suspicious return requests for human review using cost-sensitive threshold selection — never auto-denying a refund."
+description: "Mirror Fit's returns-risk model flags suspicious returns for human review using cost-sensitive threshold selection — never auto-denying a refund."
 ---
 
 Mirror Fit's returns-risk model is a binary classifier over return requests. It outputs a **probability** of fraud and selects a decision threshold by minimising weighted cost rather than maximising accuracy or F1. The system produces exactly two outcomes: approve a refund, or route it to a human reviewer. It can never auto-deny a refund — that constraint is structural, not conventional. A false positive costs a genuine customer a review step and some delay; it never costs them their refund.
@@ -32,11 +32,12 @@ The empirical cost sweep on the validation set independently landed on **0.787**
 
 ### Candidate threshold comparison (validation set)
 
-| Threshold | Label | Precision | Recall | FPR | Flag rate | FP | Cost/case |
-|----------:|-------|----------:|-------:|----:|----------:|---:|---------:|
-| 0.500 | default | 0.810 | 0.266 | 0.0049 | 0.024 | 11 | 0.0771 |
-| 0.323 | max-F1 | 0.622 | 0.390 | 0.0189 | 0.046 | 42 | 0.1325 |
-| **0.787** | **cost-optimal** | **1.000** | 0.147 | **0.0000** | 0.011 | **0** | **0.0629** |
+| Threshold | Label | Precision | Recall | FPR | Flag rate | F1 | FP | FN | Cost/case |
+|----------:|-------|----------:|-------:|----:|----------:|---:|---:|---:|---------:|
+| 0.500 | default | 0.810 | 0.266 | 0.0049 | 0.024 | 0.400 | 11 | 130 | 0.0771 |
+| 0.323 | max-F1 | 0.622 | 0.390 | 0.0189 | 0.046 | **0.479** | 42 | 108 | 0.1325 |
+| 0.315 | precision ≥ 0.60 | 0.600 | 0.390 | 0.0207 | 0.048 | 0.473 | 46 | 108 | 0.1408 |
+| **0.787** | **cost-optimal** | **1.000** | 0.147 | **0.0000** | 0.011 | 0.256 | **0** | 151 | **0.0629** |
 
 The max-F1 row is what a conventional pipeline ships. Under this cost matrix it is the **most expensive** option — more than double the cost-optimal — because F1 treats a wrongly-flagged customer and a missed fraud as equally bad, and the business does not.
 
